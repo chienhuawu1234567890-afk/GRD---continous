@@ -1,0 +1,868 @@
+# Synthetic IBS: primary GRD-only semi-blinded monitoring and frozen-boundary sensitivity.
+# Original-label paths are simulation references; RC is secondary only.
+# Base R only; R >= 3.6. All participant data are synthetic.
+# source("GRD_synthetic_IBS_semiblinded_v8.R")
+# result <- run_example("quick")   # implementation smoke check only
+# result <- run_example("full")    # 72 panels x 50,000 trials, plus calibration
+# CLI: Rscript GRD_synthetic_IBS_semiblinded_v8.R quick
+# CLI: Rscript GRD_synthetic_IBS_semiblinded_v8.R full
+# Source alone loads the runner and does not start simulations.
+# This replaces the supplied illustration. It is not the original executed
+# source of prior manuscript tables, and does not reproduce Tables 1-4.
+# Full settings: Bcal=300000, Meval=50000, Bbrown=500000.
+# Fresh calibration/evaluation required: do not reuse v5/v6 checkpoints.
+# No DMC acceptance or independent external verification is claimed.
+
+.grd_loaded_source <- local({
+ p<-tryCatch(sys.frame(1)$ofile,error=function(e) NULL)
+ if(is.null(p)) {
+   arg<-grep("^--file=",commandArgs(),value=TRUE)
+   if(length(arg)) p<-sub("^--file=","",arg[1])
+ }
+ if(length(p)==1L && file.exists(p))
+   list(path=normalizePath(p,mustWork=TRUE),md5=unname(tools::md5sum(p))) else
+   list(path=NA_character_,md5=NA_character_)
+})
+
+run_example <- function(mode=c("quick","full"),outdir=NULL,
+                        Bcal=NULL,Meval=NULL,Bbrown=NULL) {
+requested_mode<-match.arg(mode)
+atomic_saveRDS <- function(object,file,...) {
+  temporary<-tempfile(pattern=".checkpoint_",tmpdir=dirname(file))
+  on.exit(unlink(temporary),add=TRUE)
+  saveRDS(object,temporary,...)
+  if(file.rename(temporary,file)) return(invisible(file))
+  # Some platforms do not replace an existing file by rename.
+  backup<-paste0(file,".previous")
+  if(file.exists(backup)) stop("Unresolved checkpoint backup: ",backup)
+  had_old<-file.exists(file)
+  if(had_old && !file.rename(file,backup)) stop("Cannot preserve prior checkpoint")
+  if(!file.rename(temporary,file)) {
+    if(had_old) file.rename(backup,file)
+    stop("Checkpoint rename failed: ",file)
+  }
+  if(had_old) unlink(backup)
+  invisible(file)
+}
+VERSION_TAG <- "v8_IBS_RG_primary_20261102"
+SAVE_TRIAL_LEVEL <- FALSE
+MIN_EXPECTED_TAIL <- 200L
+source_path <- .grd_loaded_source$path
+source_md5 <- .grd_loaded_source$md5
+if(length(source_path)!=1L || !file.exists(source_path) || is.na(source_md5))
+  stop("Save and source the complete R file before calling run_example().")
+if(!identical(unname(tools::md5sum(source_path)),source_md5))
+  stop("Source file changed since loading. Source the saved file again.")
+mode <- if(requested_mode=="full") "full" else "smoke"
+Bcal <- if(is.null(Bcal)) if(mode=="full") 300000L else 300L else as.integer(Bcal)
+Meval <- if(is.null(Meval)) if(mode=="full") 50000L else 100L else as.integer(Meval)
+Bbrown <- if(is.null(Bbrown)) if(mode=="full") 500000L else 2000L else as.integer(Bbrown)
+stopifnot(length(Bcal)==1L,length(Meval)==1L,length(Bbrown)==1L,
+ is.finite(Bcal),is.finite(Meval),is.finite(Bbrown),
+ Bcal>=200L,Meval>=100L,Bbrown>=1000L)
+alpha <- .05
+# Increase counts as needed to resolve the smallest spending increment.
+first_spending <- 2*pnorm(-qnorm(1-alpha/2)/sqrt(1/3))
+if(mode=="full") {
+  if(Meval<50000L) stop("Full mode requires at least 50,000 validation trials.")
+  required <- as.integer(ceiling(MIN_EXPECTED_TAIL/first_spending))
+  Bcal <- max(Bcal,required); Bbrown <- max(Bbrown,required)
+}
+RNGkind("Mersenne-Twister","Inversion","Rejection")
+if(length(source_path)!=1L || !file.exists(source_path) ||
+   length(source_md5)!=1L || is.na(source_md5))
+  stop("Save this complete script as a file and execute using source() or Rscript.")
+source_path <- normalizePath(source_path,mustWork=TRUE)
+# Separate code versions cannot overwrite each other's checkpoints.
+if(is.null(outdir)) outdir <- paste0("GRD_IBS_v8_",mode,"_B",Bcal,"_M",Meval,
+ "_BB",Bbrown,"_",substr(source_md5,1,10))
+stopifnot(is.character(outdir),length(outdir)==1L,nzchar(outdir))
+dir.create(outdir,recursive=TRUE,showWarnings=FALSE)
+# Reject a mismatched folder before touching its status or completion marker.
+prior_spec<-file.path(outdir,"run_specification.rds")
+if(file.exists(prior_spec)) {
+ prior<-readRDS(prior_spec)
+ if(!identical(prior$source_md5,source_md5) || !identical(prior$mode,mode) ||
+    !identical(prior$Bcal,Bcal) || !identical(prior$Meval,Meval) ||
+    !identical(prior$Bbrown,Bbrown) || !identical(prior$R_version,R.version.string))
+   stop("Incompatible output folder. Choose a new outdir.")
+}
+status_file <- file.path(outdir,"run_status.csv")
+write_status <- function(status,completed,expected) {
+  write.csv(data.frame(version=VERSION_TAG,mode=mode,status=status,
+    completed_panels=completed,expected_panels=expected,
+    updated=as.character(Sys.time())),status_file,row.names=FALSE)
+}
+# Old success markers must never survive a failed or interrupted new invocation.
+if(file.exists(file.path(outdir,"COMPLETE.txt"))) unlink(file.path(outdir,"COMPLETE.txt"))
+write_status("STARTED",0L,if(mode=="full") 72L else 36L)
+cat("Version:",VERSION_TAG,"\nOutput:",normalizePath(outdir),"\n")
+cat("Mode:",mode,"Bcal:",Bcal,"Meval:",Meval,"Bbrown:",Bbrown,"\n")
+if(mode=="smoke") cat("SMOKE ONLY: implementation check, not manuscript evidence.\n")
+routing <- function(p,eta) {
+  stopifnot(length(p)>=2L, all(is.finite(p)), all(p>0),
+            abs(sum(p)-1)<1e-10, is.finite(eta), eta>=0, eta<1)
+  Q <- (1-eta)*diag(length(p))+eta*outer(p,rep(1,length(p)))
+  stopifnot(max(abs(colSums(Q)-1))<1e-10,
+            min(svd(Q)$d)>1e-10)
+  Q
+}
+privacy <- function(Q) {
+  if(any(Q<=0)) return(Inf)
+  max(vapply(seq_len(nrow(Q)),function(j) log(max(Q[j,])/min(Q[j,])),0.0))
+}
+wilson <- function(k,n,z=qnorm(.975)) {
+  if(n<1) return(c(NA_real_,NA_real_))
+  stopifnot(is.finite(k),is.finite(n),k>=0,k<=n)
+  p <- k/n
+  d <- 1+z^2/n
+  center <- (p+z^2/(2*n))/d
+  half <- z*sqrt(p*(1-p)/n+z^2/(4*n^2))/d
+  pmax(0,pmin(1,c(center-half,center+half)))
+}
+# Fail fast if the interval routine is incorrectly implemented.
+stopifnot(wilson(960,20000)[1] < 0.048,
+          wilson(960,20000)[2] > 0.048,
+          wilson(0,200)[1] >= 0,
+          wilson(200,200)[2] <= 1+1e-12)
+
+spend <- function(t) ifelse(t<=0,0,2*pnorm(-qnorm(1-alpha/2)/sqrt(t)))
+
+# Calibration is independent of evaluation seeds.
+# Omnibus d-dimensional Brownian statistic is ||B_d(t)||^2/t, not Z^2 for d>1.
+calibrate <- function(d,t,B,seed) {
+  set.seed(seed); K<-length(t); state<-matrix(0,B,d); prev<-0
+  W<-matrix(NA_real_,B,K)
+  for(k in seq_len(K)) {
+    state<-state+matrix(rnorm(B*d,sd=sqrt(t[k]-prev)),B,d)
+    W[,k]<-rowSums(state^2)/t[k]; prev<-t[k]
+  }
+  # Identical empirical crossing-budget convention for both calibrators.
+  f<-calibrate_method(W,t,"Brownian")
+  z<-f$diagnostics
+  z$information_fraction<-t
+  z$expected_crossings<-z$target_count
+  list(boundaries=f$b,diagnostics=z,seed=seed)
+}
+
+# Contrasts against the last treatment arm (placebo/reference).
+contrast_matrix <- function(g) cbind(diag(g-1),-rep(1,g-1))
+
+# Calculate all scheduled fixed-look statistics for paired simulation.
+# Separate diagnostic runs below assess ordinary fixed-look CI coverage.
+# These are NOT confidence intervals valid at a random stopping time.
+wald_ipw <- function(X,looks,C) {
+  K<-length(looks);d<-nrow(C)
+  W<-rep(NA_real_,K); contrasts<-matrix(NA_real_,K,d)
+  se<-matrix(NA_real_,K,d); failed<-rep(FALSE,K)
+  for(k in seq_len(K)) {
+    n<-looks[k];x<-X[seq_len(n),,drop=FALSE]
+    means<-colMeans(x)
+    v<-crossprod(sweep(x,2,means,'-'))/(n-1)
+    h<-C%*%v%*%t(C)
+    contrasts[k,]<-as.vector(C%*%means)
+    diag_h<-diag(h)
+    se[k,]<-sqrt(pmax(0,diag_h/n))
+    eig<-tryCatch(eigen(h,symmetric=TRUE,only.values=TRUE)$values,
+                  error=function(e) rep(NA_real_,d))
+    if(any(!is.finite(eig)) || min(eig)<=0 || min(eig)<=max(eig)*1e-10) {
+      failed[k]<-TRUE;next
+    }
+    vct<-contrasts[k,]
+    W[k]<-tryCatch(as.numeric(n*crossprod(vct,solve(h,vct))),
+                   error=function(e) NA_real_)
+    if(!is.finite(W[k]) || W[k]<0) {W[k]<-NA_real_;failed[k]<-TRUE}
+  }
+  list(W=W,contrasts=contrasts,se=se,failed=failed,empty=rep(FALSE,K))
+}
+
+wald_conventional <- function(A,Y,looks,g,C) {
+  K<-length(looks);d<-nrow(C)
+  W<-rep(NA_real_,K); contrasts<-matrix(NA_real_,K,d)
+  se<-matrix(NA_real_,K,d);failed<-rep(FALSE,K);empty<-rep(FALSE,K)
+  for(k in seq_len(K)) {
+    idx<-seq_len(looks[k]);groups<-split(Y[idx],factor(A[idx],levels=seq_len(g)))
+    ns<-lengths(groups);empty[k]<-any(ns==0)
+    if(any(ns<2)) {failed[k]<-TRUE;next}
+    means<-vapply(groups,mean,0.0)
+    vv<-vapply(groups,var,0.0)/ns
+    h<-C%*%diag(vv,g)%*%t(C)
+    contrasts[k,]<-as.vector(C%*%means)
+    se[k,]<-sqrt(pmax(0,diag(h)))
+    eig<-tryCatch(eigen(h,symmetric=TRUE,only.values=TRUE)$values,
+                  error=function(e) rep(NA_real_,d))
+    if(any(!is.finite(eig)) || min(eig)<=0 || min(eig)<=max(eig)*1e-10) {
+      failed[k]<-TRUE;next
+    }
+    vct<-contrasts[k,]
+    W[k]<-tryCatch(as.numeric(crossprod(vct,solve(h,vct))),
+                   error=function(e) NA_real_)
+    if(!is.finite(W[k]) || W[k]<0) {W[k]<-NA_real_;failed[k]<-TRUE}
+  }
+  list(W=W,contrasts=contrasts,se=se,failed=failed,empty=empty)
+}
+
+outcomes <- function(A,delta,m,sigma,model) {
+  n<-length(A)
+  noise<-switch(model,normal=rnorm(n),
+     heavy=rt(n,5)*sqrt(3/5),
+     skew=(exp(rnorm(n))-exp(.5))/sqrt(exp(2)-exp(1)),
+     stop('Unknown model'))
+  m+delta[A]+sigma[A]*noise
+}
+
+make_cfg <- function(id,g,N,eta,model="normal",m=0,Delta=0,K=2,
+                     sigma=NULL,p=NULL) {
+ if(is.null(p)) p <- if(g==3) c(1/6,1/3,1/2) else rep(1/g,g)
+ if(is.null(sigma)) sigma <- rep(1,g)
+ stopifnot(length(p)==g,length(sigma)==g,all(p>0),abs(sum(p)-1)<1e-9,
+           N>=g*3,eta>=0,eta<1)
+ looks <- unique(as.integer(round(seq_len(K)*N/K)))
+ stopifnot(length(looks)==K,tail(looks,1)==N)
+ list(id=id,g=g,N=N,eta=eta,model=model,m=m,Delta=Delta,
+      delta=seq(0,Delta,length.out=g),looks=looks,sigma=sigma,p=p)
+}
+simulate_paths <- function(cfg,M,seed) {
+ set.seed(seed)
+ g<-cfg$g; N<-cfg$N; K<-length(cfg$looks); C<-contrast_matrix(g)
+ Q<-routing(cfg$p,cfg$eta)
+ mr<-diag(1/cfg$p,g)%*%solve(Q)
+ W <- array(NA_real_,dim=c(M,K,2),
+            dimnames=list(NULL,NULL,c("GRD","Conventional")))
+ for(r in seq_len(M)) {
+   if(r %% 5000L==0L) {cat("  simulation",r,"/",M,"\n");flush.console()}
+   A<-sample.int(g,N,replace=TRUE,prob=cfg$p)
+   Y<-outcomes(A,cfg$delta,cfg$m,cfg$sigma,cfg$model)
+   U<-runif(N); Ast<-integer(N)
+   for(i in seq_len(g)) {
+     ix<-which(A==i)
+     if(length(ix)) Ast[ix]<-findInterval(U[ix],
+         c(0,cumsum(Q[,i])),rightmost.closed=TRUE)
+   }
+   stopifnot(all(Ast>=1L&Ast<=g))
+   Xr<-t(mr[,Ast,drop=FALSE])*Y
+   W[r,,1]<-wald_ipw(Xr,cfg$looks,C)$W
+   W[r,,2]<-wald_conventional(A,Y,cfg$looks,g,C)$W
+ }
+ W
+}
+
+
+# Conservative empirical first-crossing calibration. Reject only when a
+# finite statistic meets a finite threshold. Never turn failed values into
+# a -Inf boundary. Ties can make achieved spending lower than the target.
+# This limits EMPIRICAL calibration crossings, not true null probability.
+calibrate_method <- function(W,t,method) {
+ B<-nrow(W); K<-ncol(W); alive<-rep(TRUE,B); b<-rep(Inf,K)
+ rows<-vector("list",K);prev<-0
+ for(k in seq_len(K)) {
+   increment<-spend(t[k])-spend(prev)
+   budget<-as.integer(floor(B*increment+1e-10))
+   x<-sort(W[alive & is.finite(W[,k]),k],decreasing=TRUE)
+   # At most budget first crossings across all B paths.
+   if(budget>0L && length(x)>0L) {
+     if(budget>=length(x)) b[k]<-min(x) else {
+       candidate<-x[budget]
+       if(sum(x>=candidate)<=budget) b[k]<-candidate else {
+         higher<-x[x>candidate]
+         b[k]<-if(length(higher)) min(higher) else Inf
+       }
+     }
+   }
+   hit<-alive & is.finite(W[,k]) & W[,k]>=b[k]
+   rows[[k]]<-data.frame(method=method,look=k,boundary=b[k],
+      target_increment=increment,achieved_increment=mean(hit),
+      target_count=B*increment,budget_count=budget,
+      achieved_count=sum(hit),survivors=sum(alive),
+      finite_survivors=length(x),
+      low_precision=B*increment<MIN_EXPECTED_TAIL,
+      calibration_mcse=sqrt(mean(hit)*(1-mean(hit))/B),
+      insufficient_finite_paths=length(x)<budget)
+   stopifnot(sum(hit)<=budget)
+   alive[hit]<-FALSE;prev<-t[k]
+ }
+ list(b=b,diagnostics=do.call(rbind,rows))
+}
+
+crossing_matrix <- function(W,b) {
+ stopifnot(is.matrix(W),length(b)==ncol(W),!anyNA(b),all(b>=0))
+ z<-is.finite(W) & sweep(W,2,b,">=")
+ z<-z & matrix(rep(is.finite(b),each=nrow(W)),nrow(W),ncol(W))
+ z[is.na(z)]<-FALSE
+ z
+}
+# Primary efficacy function: intentionally accepts no original-label data.
+grd_only_paths <- function(Wg,bg,looks) {
+ stopifnot(is.matrix(Wg),length(looks)==ncol(Wg),all(diff(looks)>0))
+ G<-crossing_matrix(Wg,bg); f<-first_hit(G); K<-length(looks)
+ reached<-outer(ifelse(f>0L,f,K),seq_len(K),">=")
+ data.frame(reject=as.integer(f>0L),stoplook=f,
+   nstop=looks[ifelse(f>0L,f,K)],
+   failed_reached=as.integer(rowSums(reached & !is.finite(Wg))>0L),
+   unresolved=as.integer(f==0L & !is.finite(Wg[,K])))
+}
+first_hit <- function(z) {
+ f<-max.col(z,ties.method="first")
+ f[rowSums(z)==0L]<-0L
+ as.integer(f)
+}
+
+# RC: at each reached scheduled look, query the original-label statistic
+# ONLY if the GRD statistic crosses. If confirmation fails, continue to the
+# next scheduled look and query again only if GRD crosses again. Stop at
+# first simultaneous crossing. No futility or calendar-time model is added.
+policy_paths <- function(Wg,Wo,bg,bo,looks) {
+ stopifnot(identical(dim(Wg),dim(Wo)),ncol(Wg)==length(looks))
+ G<-crossing_matrix(Wg,bg);O<-crossing_matrix(Wo,bo)
+ M<-nrow(G);K<-ncol(G)
+ fg<-first_hit(G);fo<-first_hit(O);fc<-first_hit(G & O)
+ stopC<-ifelse(fc>0L,fc,K)
+ reached<-outer(stopC,seq_len(K),">=")
+ requested<-G & reached
+ finiteO<-is.finite(Wo)
+ nconf<-rowSums(requested)
+ failuresG<-rowSums(reached & !is.finite(Wg))>0L
+ failuresO<-rowSums(requested & !finiteO)>0L
+ # Original-label results outside 'requested' are COUNTERFACTUAL comparisons.
+ # They are never made available to the operational RC analyst/DMC stream.
+ row<-function(f) data.frame(reject=as.integer(f>0L),stoplook=f,
+    nstop=looks[ifelse(f>0L,f,K)])
+ dg<-grd_only_paths(Wg,bg,looks);do<-row(fo);dc<-row(fc)
+ reachedO<-outer(ifelse(fo>0L,fo,K),seq_len(K),">=")
+ do$failed_reached<-as.integer(rowSums(reachedO & !is.finite(Wo))>0L)
+ do$unresolved<-as.integer(fo==0L & !is.finite(Wo[,K]))
+ dc$confirmation_attempts<-nconf
+ dc$confirmation_completed<-rowSums(requested & finiteO)
+ dc$confirmation_failed_numeric<-rowSums(requested & !finiteO)
+ dc$unconfirmed_signals<-rowSums(requested & !O)
+ dc$failed_reached<-as.integer(failuresG|failuresO)
+ dc$unresolved<-as.integer(fc==0L &
+    (!is.finite(Wg[,K]) | (G[,K] & !is.finite(Wo[,K]))))
+ dc$final_unconfirmed_signal<-as.integer(fc==0L & G[,K])
+ # End-of-study non-confirmation is an outcome, not missing delay data.
+ # Capped delay assigns N (K) if no RC rejection by the horizon.
+ dc$delay_N_vs_O_capped<-dc$nstop-do$nstop
+ dc$delay_looks_vs_O_capped<-ifelse(fc>0L,fc,K)-ifelse(fo>0L,fo,K)
+ dc$delay_N_vs_G_capped<-dc$nstop-dg$nstop
+ dc$delay_looks_vs_G_capped<-ifelse(fc>0L,fc,K)-ifelse(fg>0L,fg,K)
+ dc$both_C_O_reject<-as.integer(fc>0L & fo>0L)
+ dc$both_C_G_reject<-as.integer(fc>0L & fg>0L)
+ dc$delay_N_vs_O_both<-ifelse(fc>0L & fo>0L,dc$nstop-do$nstop,NA_real_)
+ dc$delay_looks_vs_O_both<-ifelse(fc>0L & fo>0L,fc-fo,NA_real_)
+ dc$delay_N_vs_G_both<-ifelse(fc>0L & fg>0L,dc$nstop-dg$nstop,NA_real_)
+ dc$delay_looks_vs_G_both<-ifelse(fc>0L & fg>0L,fc-fg,NA_real_)
+ dc$O_reject_C_no<-as.integer(fo>0L & fc==0L)
+ dc$G_reject_C_no<-as.integer(fg>0L & fc==0L)
+ dc$no_signal<-as.integer(fg==0L)
+ dc$G_firstlook<-fg;dc$O_firstlook<-fo
+ stopifnot(all(dc$reject<=dg$reject),all(dc$reject<=do$reject),
+   all(dc$nstop>=dg$nstop),all(dc$nstop>=do$nstop),
+   all(dc$confirmation_attempts<=stopC),
+   all(dc$confirmation_attempts[dc$reject==1L]>=1L))
+ list(GRD=dg,Original=do,Confirmation=dc)
+}
+
+# Deterministic regression checks including a confirmation failure followed
+# by later success, no GRD signal, and a numerically failed final check.
+self_tests <- function() {
+ G<-rbind(c(12,12,12),c(1,1,1),c(12,1,12),c(12,12,12))
+ O<-rbind(c(1,12,12),c(12,12,12),c(1,1,NA),c(12,NA,NA))
+ z<-policy_paths(G,O,rep(10,3),rep(10,3),c(120,240,360))$Confirmation
+ stopifnot(z$stoplook[1]==2,z$confirmation_attempts[1]==2,
+   z$confirmation_attempts[2]==0,z$reject[2]==0,
+   z$unresolved[3]==1,z$failed_reached[4]==0,
+   z$confirmation_attempts[4]==1)
+ f<-calibrate_method(matrix(NA_real_,200,2),c(.5,1),"failure")
+ stopifnot(all(is.infinite(f$b)),all(f$diagnostics$achieved_count==0))
+ # A GRD crossing at an earlier look cannot latch into later confirmation.
+ q<-policy_paths(matrix(c(12,1,1),1),matrix(c(1,12,12),1),
+    rep(10,3),rep(10,3),c(120,240,360))$Confirmation
+ stopifnot(q$reject==0L,q$confirmation_attempts==1L)
+ for(e in c(0,.15,.30,.50)) {
+   Q<-routing(rep(1/3,3),e)
+   p<-rep(1/3,3);mu<-c(-.58,-.345,-.11);R<-diag(1/p)%*%solve(Q)
+   expected<-numeric(3)
+   for(a in 1:3) for(j in 1:3)
+     expected<-expected+p[a]*Q[j,a]*R[,j]*mu[a]
+   stopifnot(max(abs(expected-mu))<1e-10,
+     max(abs(Q%*%p-p))<1e-12)
+ }
+ cat("Decision and failure-policy self-tests passed.\n")
+}
+self_tests()
+# RG must be invariant to any change in the original-label reference path.
+local({
+ wg<-rbind(c(12,1,1),c(1,1,1),c(NA,12,NA),c(NA,1,NA))
+ looks<-c(120,240,360);bg<-rep(10,3)
+ primary<-grd_only_paths(wg,bg,looks)
+ for(wo in list(matrix(0,4,3),matrix(100,4,3),matrix(NA_real_,4,3)))
+   stopifnot(identical(primary,policy_paths(wg,wo,bg,bg,looks)$GRD))
+ stopifnot(identical(primary$stoplook,c(1L,0L,2L,0L)),
+   identical(as.numeric(primary$nstop),c(120,360,240,360)),
+   primary$failed_reached[3]==1L,primary$unresolved[4]==1L)
+ cat("Primary GRD independence and stopping tests passed.\n")
+})
+
+
+
+
+# Incremental analysis and a QR-based internal cross-check. This is a
+# computational consistency check, NOT independent external validation.
+incremental_summary <- function(n,s,ss,C) {
+  mu<-s/n; v<-(ss-tcrossprod(s)/n)/(n-1)
+  v<-(v+t(v))/2; h<-C%*%v%*%t(C); z<-as.vector(C%*%mu)
+  eig<-eigen(h,symmetric=TRUE,only.values=TRUE)$values
+  ok<-all(is.finite(eig)) && min(eig)>max(eig)*1e-10 && min(eig)>0
+  w<-if(ok) as.numeric(n*crossprod(z,solve(h,z))) else NA_real_
+  list(mean=mu,covariance=v,contrast=z,se=sqrt(pmax(0,diag(h)/n)),
+       W=w,valid=ok)
+}
+close_numeric <- function(a,b,tol=1e-8) {
+  if(!identical(is.na(a),is.na(b))) return(FALSE)
+  good<-is.finite(a)&is.finite(b)
+  if(any(is.infinite(a)|is.infinite(b)))
+    if(!identical(a[!good],b[!good])) return(FALSE)
+  all(abs(a[good]-b[good])<=tol*(1+pmax(abs(a[good]),abs(b[good]))))
+}
+
+# Primary synthetic dry run. Original labels are used by the restricted routing
+# service only; no original-label efficacy statistic is computed or released.
+simulate_one_trial <- function(cfg,bg,seed) {
+  set.seed(seed);g<-cfg$g;K<-length(cfg$looks);C<-contrast_matrix(g)
+  Q<-routing(cfg$p,cfg$eta);M<-diag(1/cfg$p,g)%*%solve(Q)
+  A<-sample.int(g,cfg$N,replace=TRUE,prob=cfg$p)
+  Y<-outcomes(A,cfg$delta,cfg$m,cfg$sigma,cfg$model)
+  Ast<-rep(NA_integer_,cfg$N);X<-matrix(NA_real_,cfg$N,g)
+  sums<-numeric(g);ss<-matrix(0,g,g);prev<-0L
+  rows<-details<-timing<-list()
+  for(k in seq_len(K)) {
+    n<-cfg$looks[k];new<-seq.int(prev+1L,n)
+    old<-if(prev>0L) Ast[seq_len(prev)] else integer()
+    start<-proc.time()[['elapsed']]
+    for(u in new) Ast[u]<-sample.int(g,1L,prob=Q[,A[u]])
+    routing_seconds<-proc.time()[['elapsed']]-start
+    immutable<-identical(old,if(prev>0L) Ast[seq_len(prev)] else integer())
+    stopifnot(immutable,all(!is.na(Ast[seq_len(n)])))
+    start<-proc.time()[['elapsed']]
+    X[new,]<-t(M[,Ast[new],drop=FALSE])*Y[new]
+    batch<-X[new,,drop=FALSE]
+    sums<-sums+colSums(batch);ss<-ss+crossprod(batch)
+    inc<-incremental_summary(n,sums,ss,C)
+    analysis_seconds<-proc.time()[['elapsed']]-start
+    start<-proc.time()[['elapsed']]
+    direct<-wald_ipw(X[seq_len(n),,drop=FALSE],n,C)
+    xfull<-X[seq_len(n),,drop=FALSE]
+    h<-C%*%cov(xfull)%*%t(C);z<-as.vector(C%*%colMeans(xfull))
+    wqr<-if(inc$valid) as.numeric(n*crossprod(z,qr.solve(h,z))) else NA_real_
+    mean_match<-close_numeric(inc$mean,colMeans(xfull))
+    covariance_match<-close_numeric(inc$covariance,cov(xfull))
+    wald_match<-close_numeric(inc$W,direct$W) && close_numeric(inc$W,wqr)
+    stopifnot(mean_match,covariance_match,wald_match)
+    check_seconds<-proc.time()[['elapsed']]-start
+    G<-is.finite(inc$W) && is.finite(bg[k]) && inc$W>=bg[k]
+    rows[[k]]<-data.frame(look=k,N=n,new_records=length(new),eta=cfg$eta,
+      W_GRD=inc$W,b_GRD=bg[k],GRD_crossing=G,primary_policy="RG",
+      statistical_efficacy_rejection=G,numerical_failure=!is.finite(inc$W),
+      disposition=if(G) "GRD_statistical_efficacy_crossing" else
+        if(!is.finite(inc$W)) "numerical_failure_no_rejection" else "no_GRD_crossing",
+      action=if(G) "stop_formal_efficacy_testing" else if(k==K)
+        "end_without_GRD_rejection" else "continue",
+      immutable_routing=immutable,means_match=mean_match,
+      covariance_match=covariance_match,wald_match=wald_match)
+    details[[k]]<-list(look=k,N=n,mean=inc$mean,covariance=inc$covariance,
+      contrasts=inc$contrast,SE=inc$se,C=C,QR_W=wqr)
+    timing[[k]]<-data.frame(look=k,N=n,routing_seconds=routing_seconds,
+      incremental_analysis_seconds=analysis_seconds,internal_check_seconds=check_seconds)
+    prev<-n
+    if(G) break
+  }
+  list(report=do.call(rbind,rows),details=details,timing=do.call(rbind,timing),
+    restricted_records=data.frame(id=seq_len(cfg$N),A=A,Y=Y,Ast=Ast),
+    seed=seed,cfg=cfg,Q=Q,epsilon=privacy(Q),bg=bg,
+    scope="Synthetic RG-only technical dry run; no independent external or DMC validation.")
+}
+write_example <- function(cfg,fit,seed,outdir) {
+  # Example always uses frozen nominal finite-sample boundaries.
+  ex<-simulate_one_trial(cfg,fit$GRD$b,seed)
+  prefix<-file.path(outdir,paste0("example_",cfg$id))
+  start<-proc.time()[['elapsed']]
+  write.csv(ex$report,paste0(prefix,"_DMC_report.csv"),row.names=FALSE)
+  atomic_saveRDS(ex$details,paste0(prefix,"_analysis_details.rds"))
+  report_seconds<-proc.time()[['elapsed']]-start
+  write.csv(ex$timing,paste0(prefix,"_timings.csv"),row.names=FALSE)
+  write.csv(data.frame(seed=seed,selection="First trial at prespecified seed; no outcome search",
+    boundary_scheme="FrozenNominalFS",epsilon=ex$epsilon,
+    report_write_seconds=report_seconds,
+    independent_external_validation=FALSE,DMC_acceptance_evaluated=FALSE),
+    paste0(prefix,"_metadata.csv"),row.names=FALSE)
+  restricted<-file.path(outdir,"restricted_synthetic_examples")
+  dir.create(restricted,showWarnings=FALSE)
+  atomic_saveRDS(ex,file.path(restricted,paste0(cfg$id,"_restricted.rds")))
+  # These files contain original labels and routing realization. Never treat
+  # the restricted archive as a DP-protected operational release.
+  invisible(ex)
+}
+
+# Exact contribution covariance under independent allocation:
+# E[XX'] = P^-1 Q^-1 diag(Q P m2) Q^-T P^-1.
+contribution_moments <- function(cfg) {
+  mu<-cfg$m+cfg$delta; Q<-routing(cfg$p,cfg$eta)
+  M<-diag(1/cfg$p,cfg$g)%*%solve(Q)
+  second_dest<-as.vector(Q%*%(cfg$p*(cfg$sigma^2+mu^2)))
+  v<-M%*%diag(second_dest,cfg$g)%*%t(M)-tcrossprod(mu)
+  list(mean=mu,covariance=v)
+}
+fixed_look_diagnostics <- function(cfg,M,seed,outdir) {
+  # Independent diagnostic replicates, unrelated to calibration/evaluation.
+  # Both null and alternative; only nominal normal nuisance configuration.
+  set.seed(seed);g<-cfg$g;K<-length(cfg$looks);C<-contrast_matrix(g)
+  Q<-routing(cfg$p,cfg$eta);R<-diag(1/cfg$p,g)%*%solve(Q)
+  rows<-list();covrows<-list()
+  for(hypothesis in c("null","alternative")) {
+    ev<-cfg;if(hypothesis=="null") {ev$Delta<-0;ev$delta<-rep(0,g)}
+    truth<-as.vector(C%*%(ev$m+ev$delta));moment<-contribution_moments(ev)
+    est<-ses<-array(NA_real_,c(M,K,g-1));vc<-array(NA_real_,c(M,K,g,g))
+    for(r in seq_len(M)) {
+      A<-sample.int(g,ev$N,TRUE,prob=ev$p)
+      Y<-outcomes(A,ev$delta,ev$m,ev$sigma,ev$model)
+      Ast<-vapply(A,function(a) sample.int(g,1L,prob=Q[,a]),1L)
+      X<-t(R[,Ast,drop=FALSE])*Y
+      d<-wald_ipw(X,ev$looks,C);est[r,,]<-d$contrasts;ses[r,,]<-d$se
+      for(k in seq_len(K)) vc[r,k,,]<-cov(X[seq_len(ev$looks[k]),,drop=FALSE])
+    }
+    for(k in seq_len(K)) {
+      for(j in seq_len(g-1)) {
+        e<-est[,k,j];se<-ses[,k,j];valid<-is.finite(e)&is.finite(se)&se>0
+        covered<-abs(e[valid]-truth[j])<=qnorm(.975)*se[valid]
+        rate<-if(any(valid)) mean(covered) else NA_real_
+        rows[[length(rows)+1L]]<-data.frame(case=ev$id,hypothesis=hypothesis,
+          seed=seed,M=M,look=k,N=ev$looks[k],contrast=j,truth=truth[j],
+          bias=mean(e)-truth[j],empirical_SD=sd(e),mean_estimated_SE=mean(se),
+          theoretical_SE=sqrt((C%*%moment$covariance%*%t(C))[j,j]/ev$looks[k]),
+          coverage=rate,coverage_denominator=sum(valid),invalid_count=sum(!valid),
+          coverage_mcse=if(any(valid)) sqrt(rate*(1-rate)/sum(valid)) else NA_real_,
+          interpretation="Ordinary fixed-look marginal CI, not post-stopping CI")
+      }
+      empirical_v<-apply(vc[,k,,,drop=FALSE],c(3,4),mean)
+      for(a in seq_len(g)) for(b in seq_len(g))
+        covrows[[length(covrows)+1L]]<-data.frame(case=ev$id,hypothesis=hypothesis,
+          look=k,N=ev$looks[k],row=a,column=b,
+          mean_estimated_contribution_covariance=empirical_v[a,b],
+          theoretical_contribution_covariance=moment$covariance[a,b])
+    }
+  }
+  write.csv(do.call(rbind,rows),file.path(outdir,paste0("fixed_look_",cfg$id,".csv")),row.names=FALSE)
+  write.csv(do.call(rbind,covrows),file.path(outdir,paste0("covariance_check_",cfg$id,".csv")),row.names=FALSE)
+}
+
+# Nominal null calibration is frozen. Validation scenarios retain identical
+# allocation/routing/looks but change nuisance means, scales or distribution.
+# This is a misspecification study, NOT nuisance-robust boundary construction.
+sensitivity_configs <- function(cfg) {
+ nominal<-cfg;nominal$model<-"normal";nominal$sigma<-rep(1,cfg$g)
+ nominal$Delta<-0;nominal$delta<-rep(0,cfg$g)
+ variants<-list(matched=nominal)
+ variants$mean_lower<-nominal;variants$mean_lower$m<-nominal$m-1
+ variants$mean_higher<-nominal;variants$mean_higher$m<-nominal$m+1
+ variants$scale_small<-nominal;variants$scale_small$sigma<-rep(.75,cfg$g)
+ variants$scale_large<-nominal;variants$scale_large$sigma<-rep(1.5,cfg$g)
+ variants$heteroscedastic<-nominal
+ variants$heteroscedastic$sigma<-seq(1,2,length.out=cfg$g)
+ variants$heavy_t5<-nominal;variants$heavy_t5$model<-"heavy"
+ variants$skew_lognormal<-nominal;variants$skew_lognormal$model<-"skew"
+ variants$combined_shift_scale_heavy<-variants$heavy_t5
+ variants$combined_shift_scale_heavy$m<-nominal$m+1
+ variants$combined_shift_scale_heavy$sigma<-seq(1,2,length.out=cfg$g)
+ variants
+}
+
+avg <- function(x) if(all(is.na(x))) NA_real_ else mean(x,na.rm=TRUE)
+semean <- function(x) {
+ x<-x[is.finite(x)];if(length(x)<2L) NA_real_ else sd(x)/sqrt(length(x))
+}
+summary_rows <- function(cfg,scenario,hypothesis,scheme,pol,seed) {
+ common<-data.frame(case=cfg$id,scenario=scenario,hypothesis=hypothesis,
+  boundary=scheme,g=cfg$g,N=cfg$N,K=length(cfg$looks),eta=cfg$eta,
+  validation_model=cfg$model,validation_common_mean=cfg$m,
+  validation_sigma=paste(cfg$sigma,collapse=";"),Delta=cfg$Delta,
+  M=Meval,validation_seed=seed)
+ rates<-list()
+ for(nm in names(pol)) {
+   d<-pol[[nm]];n<-nrow(d);nr<-sum(d$reject);ci<-wilson(nr,n)
+   rates[[nm]]<-cbind(common,data.frame(policy=nm,rejections=nr,
+      rejection_rate=nr/n,mcse=sqrt(nr/n*(1-nr/n)/n),
+      ci_low=ci[1],ci_high=ci[2],ESS=mean(d$nstop),
+      ESS_mcse=semean(d$nstop),
+      analysis_role=if(nm=="GRD") "primary" else if(nm=="Original") "simulation_reference" else "secondary_policy",
+      failed_reached_rate=mean(d$failed_reached),unresolved_rate=mean(d$unresolved),
+      first_look_rejection=mean(d$stoplook==1L),early_stop=mean(d$stoplook>0 & d$stoplook<length(cfg$looks))))
+ }
+ d<-pol$Confirmation
+ # Expose denominators of every conditional delay. Do not interpret them
+ # as unconditional delay or as elapsed calendar time.
+ operations<-cbind(common,data.frame(
+   confirmation_attempts_mean=avg(d$confirmation_attempts),
+   confirmation_attempts_mcse=semean(d$confirmation_attempts),
+   confirmation_completed_mean=avg(d$confirmation_completed),
+   confirmation_numeric_failures_mean=avg(d$confirmation_failed_numeric),
+   any_confirmation_rate=mean(d$confirmation_attempts>0),
+   unconfirmed_signals_mean=avg(d$unconfirmed_signals),
+   failed_reached_rate=avg(d$failed_reached),unresolved_rate=avg(d$unresolved),
+   final_unconfirmed_signal_rate=avg(d$final_unconfirmed_signal),
+   O_reject_C_no_rate=avg(d$O_reject_C_no),
+   G_reject_C_no_rate=avg(d$G_reject_C_no),
+   C_rejects=sum(d$reject),O_rejects=sum(pol$Original$reject),
+   G_rejects=sum(pol$GRD$reject),
+   no_GRD_signal_rate=avg(d$no_signal)))
+ for(ref in c("O","G")) {
+   for(unit in c("N","looks")) {
+     for(kind in c("capped","both")) {
+       v<-paste0("delay_",unit,"_vs_",ref,"_",kind)
+       operations[[paste0(v,"_mean")]]<-avg(d[[v]])
+       operations[[paste0(v,"_mcse")]]<-semean(d[[v]])
+       operations[[paste0(v,"_n")]]<-sum(!is.na(d[[v]]))
+     }
+   }
+   den<-sum(pol[[if(ref=="O") "Original" else "GRD"]]$reject)
+   operations[[paste0(ref,"_reject_C_no_conditional")]]<-
+     if(den>0) sum(d[[paste0(ref,"_reject_C_no")]])/den else NA_real_
+ }
+ g<-pol$GRD;o<-pol$Original
+ comparison<-cbind(common,data.frame(
+   comparison_role="paired_simulation_reference_not_operational_gate",
+   GRD_only_rejections=sum(g$reject==1L & o$reject==0L),
+   Original_only_rejections=sum(g$reject==0L & o$reject==1L),
+   both_rejections=sum(g$reject==1L & o$reject==1L),
+   disagreement_rate=mean(g$reject!=o$reject),
+   disagreement_mcse=sqrt(mean(g$reject!=o$reject)*(1-mean(g$reject!=o$reject))/nrow(g)),
+   mean_N_GRD_minus_Original_capped=mean(g$nstop-o$nstop),
+   mcse_N_GRD_minus_Original_capped=semean(g$nstop-o$nstop)))
+ list(metrics=do.call(rbind,rates),operations=operations,comparison=comparison)
+}
+
+# Focus on the IBS design in the manuscript. All validation variants use
+# the same frozen nominal boundaries within eta. Independent allocation.
+# For other designs, explicitly replace this list with make_cfg(...) calls.
+configs<-lapply(c(0,.15,.30,.50),function(e)
+ make_cfg(paste0("IBS_eta",format(e,nsmall=2)),3,360,e,m=-.58,
+          K=3,p=rep(1/3,3)))
+if(mode=="smoke") configs<-configs[c(1,3)]
+stopifnot(mode!="full" || identical(vapply(configs,function(x) x$eta,0.0),c(0,.15,.30,.50)))
+expected_panels <- sum(vapply(configs,function(x) length(sensitivity_configs(x))*2L,0L))
+# Guard every schedule, rather than relying only on the default IBS first look.
+if(mode=="full") {
+  smallest <- min(unlist(lapply(configs,function(x) diff(c(0,spend(x$looks/x$N))))))
+  required <- as.integer(ceiling(MIN_EXPECTED_TAIL/smallest))
+  if(Bcal<required || Bbrown<required) stop("Increase calibration counts for this schedule.")
+}
+write_status("RUNNING",0L,expected_panels)
+
+specfile<-file.path(outdir,"run_specification.rds")
+if(file.exists(specfile)) {
+ prior<-readRDS(specfile)
+ compatible<-identical(prior$source_md5,source_md5) &&
+   identical(prior$mode,mode) && identical(prior$Bcal,Bcal) &&
+   identical(prior$Meval,Meval) && identical(prior$Bbrown,Bbrown) &&
+   identical(prior$configs,configs) && identical(prior$R_version,R.version.string)
+ if(!compatible) stop("Output folder belongs to an incompatible run. Choose another outdir.")
+}
+atomic_saveRDS(list(version=VERSION_TAG,configs=configs,mode=mode,Bcal=Bcal,
+ Meval=Meval,Bbrown=Bbrown,alpha=alpha,
+ source_md5=source_md5,R_version=R.version.string,eta_grid=vapply(configs,function(x)x$eta,0.0),
+ expected_panels=expected_panels,min_expected_tail=MIN_EXPECTED_TAIL,
+ primary_policy="RG: first GRD crossing, without original-label confirmation",
+ original_label_role="simulation_reference_only",
+ confirmation_policy="secondary RC: same-look; continue after unconfirmed crossing",
+ calendar_delay_model="none",trial_level=SAVE_TRIAL_LEVEL),
+ file.path(outdir,"run_specification.rds"))
+capture.output(sessionInfo(),file=file.path(outdir,"sessionInfo.txt"))
+source_copy <- file.path(outdir,"executed_source.R")
+if(!file.copy(source_path,source_copy,overwrite=TRUE) ||
+   !identical(unname(tools::md5sum(source_copy)),source_md5))
+  stop("Source archive copy or checksum verification failed.")
+writeLines(c(paste("source_MD5",source_md5),
+ "MD5 is a provenance/change-detection identifier, not a security guarantee."),
+ file.path(outdir,"source_checksum.txt"))
+all_metrics<-list();all_operations<-list();all_comparisons<-list();all_bounds<-list();manifest<-list()
+counter<-0L;example_results<-list()
+for(i in seq_along(configs)) {
+ variants<-sensitivity_configs(configs[[i]])
+ nominal<-variants$matched
+ K<-length(nominal$looks);tt<-nominal$looks/nominal$N
+ fitfile<-file.path(outdir,paste0("calibration_",nominal$id,".rds"))
+ signature<-list(version=VERSION_TAG,source_md5=source_md5,cfg=nominal,Bcal=Bcal,Bbrown=Bbrown,alpha=alpha,
+                 RNG=RNGkind(),R_version=R.version.string)
+ if(file.exists(fitfile)) {
+   fit<-readRDS(fitfile)
+   if(!identical(fit$signature,signature)) stop("Incompatible calibration checkpoint")
+ } else {
+   cat("Calibrating frozen nominal boundaries:",nominal$id,"\n");flush.console()
+   seedcal<-10000000L+i*10000L
+   wc<-simulate_paths(nominal,Bcal,seedcal)
+   fg<-calibrate_method(matrix(wc[,,1],Bcal,K),tt,"GRD")
+   fo<-calibrate_method(matrix(wc[,,2],Bcal,K),tt,"Original")
+   br<-calibrate(nominal$g-1,tt,Bbrown,20000000L+i*10000L)
+   fit<-list(signature=signature,GRD=fg,Original=fo,Brownian=br,
+             calibration_seed=seedcal)
+   atomic_saveRDS(fit,fitfile);rm(wc);invisible(gc())
+ }
+ for(method in c("GRD","Original")) {
+   bb<-fit[[method]]$diagnostics
+   bb$case<-nominal$id;bb$calibration_seed<-fit$calibration_seed
+   bb$Bcal<-Bcal;bb$nominal_model<-nominal$model
+   bb$nominal_mean<-nominal$m;bb$nominal_sigma<-paste(nominal$sigma,collapse=";")
+   all_bounds[[length(all_bounds)+1L]]<-bb
+ }
+ brown_diag<-fit$Brownian$diagnostics
+ brown_diag$case<-nominal$id
+ brown_diag$calibration_seed<-fit$Brownian$seed
+ if(any(brown_diag$low_precision)) warning("Low-precision Brownian calibration tail")
+ write.csv(brown_diag,file.path(outdir,paste0("brownian_fit_",nominal$id,".csv")),row.names=FALSE)
+ # Prespecified example seeds; no searching for a desirable result.
+ example_cfg<-nominal;example_cfg$Delta<-.47
+ example_cfg$delta<-seq(0,.47,length.out=example_cfg$g)
+ example_results[[i]]<-write_example(example_cfg,fit,40000000L+i*10000L,outdir)
+ fixed_look_diagnostics(example_cfg,if(mode=="full") 2000L else 100L,
+                        50000000L+i*10000L,outdir)
+ for(j in seq_along(variants)) {
+   cfg<-variants[[j]];scenario<-names(variants)[j]
+   manifest[[length(manifest)+1L]]<-data.frame(case=cfg$id,scenario=scenario,
+      g=cfg$g,N=cfg$N,eta=cfg$eta,model=cfg$model,m=cfg$m,
+      sigma=paste(cfg$sigma,collapse=";"),p=paste(cfg$p,collapse=";"),
+      looks=paste(cfg$looks,collapse=";"),calibration_case=nominal$id,
+      calibration_model=nominal$model,calibration_m=nominal$m,
+      calibration_sigma=paste(nominal$sigma,collapse=";"),
+      calibration_seed=fit$calibration_seed,Brownian_seed=fit$Brownian$seed,
+      validation_null_seed=30000000L+i*10000L+j*100L,
+      validation_alternative_seed=30000000L+i*10000L+j*100L+1L)
+   for(h in 0:1) {
+     hypothesis<-if(h==0L) "null" else "alternative"
+     ev<-cfg;ev$Delta<-if(h==0L) 0 else .47
+     ev$delta<-seq(0,ev$Delta,length.out=ev$g)
+     # Distinct deterministic seed blocks: calibration, Brownian, validation.
+     seed<-30000000L+i*10000L+j*100L+h
+     checkpoint<-file.path(outdir,paste0("eval_",cfg$id,"_",scenario,"_",hypothesis,".rds"))
+     evalsig<-list(signature=signature,cfg=ev,Meval=Meval,seed=seed,
+                   save_trials=SAVE_TRIAL_LEVEL)
+     if(file.exists(checkpoint)) {
+       result<-readRDS(checkpoint)
+       if(!identical(result$signature,evalsig)) stop("Incompatible evaluation checkpoint")
+       cat("Resuming:",cfg$id,scenario,hypothesis,"\n")
+     } else {
+       cat("Validating:",cfg$id,scenario,hypothesis,"M=",Meval,"\n");flush.console()
+       W<-simulate_paths(ev,Meval,seed)
+       Wg<-matrix(W[,,1],Meval,K);Wo<-matrix(W[,,2],Meval,K)
+       result<-list(signature=evalsig,metrics=list(),operations=list(),comparison=list())
+       for(scheme in c("FrozenNominalFS","Brownian")) {
+         bg<-if(scheme=="FrozenNominalFS") fit$GRD$b else fit$Brownian$boundaries
+         bo<-if(scheme=="FrozenNominalFS") fit$Original$b else fit$Brownian$boundaries
+         pol<-policy_paths(Wg,Wo,bg,bo,ev$looks)
+         sm<-summary_rows(ev,scenario,hypothesis,scheme,pol,seed)
+         result$metrics[[scheme]]<-sm$metrics
+         result$operations[[scheme]]<-sm$operations
+         result$comparison[[scheme]]<-sm$comparison
+         if(SAVE_TRIAL_LEVEL) atomic_saveRDS(pol,file.path(outdir,
+           paste0("trials_",cfg$id,"_",scenario,"_",hypothesis,"_",scheme,".rds")))
+       }
+       result$metrics<-do.call(rbind,result$metrics)
+       result$operations<-do.call(rbind,result$operations)
+       result$comparison<-do.call(rbind,result$comparison)
+       atomic_saveRDS(result,checkpoint);rm(W,Wg,Wo);invisible(gc())
+     }
+     counter<-counter+1L
+     write_status("RUNNING",counter,expected_panels)
+     all_metrics[[counter]]<-result$metrics
+     all_operations[[counter]]<-result$operations
+     all_comparisons[[counter]]<-result$comparison
+     current<-do.call(rbind,all_metrics)
+     write.csv(subset(current,policy=="GRD"),file.path(outdir,"primary_GRD_metrics.csv"),row.names=FALSE)
+     write.csv(subset(current,policy=="Confirmation"),file.path(outdir,"secondary_confirmation_metrics.csv"),row.names=FALSE)
+     write.csv(do.call(rbind,all_comparisons),file.path(outdir,"GRD_reference_comparison.csv"),row.names=FALSE)
+     write.csv(do.call(rbind,all_metrics),file.path(outdir,"policy_metrics.csv"),row.names=FALSE)
+     write.csv(do.call(rbind,all_operations),file.path(outdir,"confirmation_and_delay.csv"),row.names=FALSE)
+   }
+ }
+ write.csv(do.call(rbind,all_bounds),file.path(outdir,"frozen_FS_boundaries.csv"),row.names=FALSE)
+ write.csv(do.call(rbind,manifest),file.path(outdir,"scenario_manifest.csv"),row.names=FALSE)
+}
+metrics<-do.call(rbind,all_metrics)
+nulls<-subset(metrics,hypothesis=="null")
+nulls$pointwise_CI_lower_above_alpha<-nulls$ci_low>alpha
+nulls$pointwise_CI_upper_below_alpha<-nulls$ci_high<alpha
+# Simultaneous exact binomial intervals over the listed null rows, conditional
+# on the fitted boundaries. Not a uniform nuisance-family guarantee.
+family_n <- nrow(nulls)
+ci_family <- t(vapply(seq_len(family_n),function(i)
+ binom.test(nulls$rejections[i],nulls$M[i],
+   conf.level=1-.05/family_n)$conf.int,numeric(2)))
+nulls$family_CI_low <- ci_family[,1]
+nulls$family_CI_high <- ci_family[,2]
+nulls$family_CI_lower_above_alpha <- nulls$family_CI_low>alpha
+nulls$family_size <- family_n
+write.csv(nulls,file.path(outdir,"null_misspecification_sensitivity.csv"),row.names=FALSE)
+write.csv(subset(nulls,policy=="GRD"),file.path(outdir,"primary_GRD_null_sensitivity.csv"),row.names=FALSE)
+# Maxima over independently simulated scenarios summarize this finite set;
+# neither the maximum nor pointwise intervals prove simultaneous or uniform control.
+worst<-aggregate(rejection_rate~case+boundary+policy,data=nulls,FUN=max)
+names(worst)[names(worst)=="rejection_rate"]<-"max_observed_null_rate"
+write.csv(worst,file.path(outdir,"observed_null_maxima.csv"),row.names=FALSE)
+# Check the complete Cartesian product, not just a row count or folder name.
+expected <- do.call(rbind,lapply(configs,function(cfg)
+ expand.grid(case=cfg$id,scenario=names(sensitivity_configs(cfg)),
+   hypothesis=c("null","alternative"),boundary=c("FrozenNominalFS","Brownian"),
+   policy=c("GRD","Original","Confirmation"),stringsAsFactors=FALSE)))
+key <- function(x) do.call(paste,c(x[c("case","scenario","hypothesis","boundary","policy")],sep="|"))
+stopifnot(counter==expected_panels,nrow(metrics)==nrow(expected),
+          !anyDuplicated(key(metrics)),setequal(key(metrics),key(expected)),
+          all(metrics$M==Meval),all(abs(metrics$rejection_rate-metrics$rejections/metrics$M)<1e-12))
+operations <- do.call(rbind,all_operations)
+stopifnot(nrow(operations)==expected_panels*2L)
+stopifnot(all(vapply(example_results,function(e)
+ all(e$report$immutable_routing & e$report$means_match &
+ e$report$covariance_match & e$report$wald_match),TRUE)))
+# Algebraic count checks for the same-look confirmation subset.
+stopifnot(all(operations$C_rejects<=operations$G_rejects),
+ all(operations$C_rejects<=operations$O_rejects),
+ all(abs(operations$O_reject_C_no_rate-
+     (operations$O_rejects-operations$C_rejects)/Meval)<1e-12))
+precision <- do.call(rbind,all_bounds)
+if(any(precision$low_precision)) warning("Low-precision finite-sample tails remain; inspect diagnostics.")
+write.csv(data.frame(expected_panels=expected_panels,completed_panels=counter,
+ expected_metric_rows=nrow(expected),observed_metric_rows=nrow(metrics),
+ source_copy_verified=identical(unname(tools::md5sum(source_copy)),source_md5),
+ eta_grid=paste(vapply(configs,function(x)x$eta,0.0),collapse=";"),
+ mode=mode,source_md5=source_md5),file.path(outdir,"completion_audit.csv"),row.names=FALSE)
+write_status(if(mode=="full") "COMPLETE_FULL" else "COMPLETE_SMOKE",counter,expected_panels)
+writeLines(c(paste("Version:",VERSION_TAG),paste("Mode:",mode),
+ paste("Completed panels:",counter),paste("Metrics rows:",nrow(metrics)),
+ "Completed simulation is not evidence of prospective DMC feasibility.",
+ "Frozen nominal boundaries do not guarantee nuisance-robust control."),
+ file.path(outdir,"COMPLETE.txt"))
+archive_files<-list.files(outdir,full.names=TRUE,recursive=TRUE)
+archive_files<-archive_files[!dir.exists(archive_files) &
+ basename(archive_files)!="output_checksums.csv"]
+write.csv(data.frame(file=substring(archive_files,nchar(outdir)+2L),
+ md5=unname(tools::md5sum(archive_files))),
+ file.path(outdir,"output_checksums.csv"),row.names=FALSE)
+cat("\nDONE:",normalizePath(outdir),"\n")
+cat("PRIMARY RG: first GRD crossing; no original-label efficacy confirmation.\n")
+cat("RC outputs describe a secondary policy only.\n")
+cat("Delay units: scheduled looks / finalized outcomes, NOT days.\n")
+cat("Frozen nominal calibration is not a nuisance-robust guarantee.\n")
+if(mode=="smoke") cat("SMOKE ONLY: rerun full before reporting scientific results.\n")
+
+examples<-lapply(example_results,function(e)e$report)
+return(invisible(list(outdir=normalizePath(outdir),mode=mode,
+ data=example_results[[1]]$restricted_records,
+ analysis=do.call(rbind,examples),operating=metrics,
+ primary=subset(metrics,policy=="GRD"),
+ comparison=do.call(rbind,all_comparisons),operations=operations,
+ examples=example_results,boundaries=all_bounds,manifest=do.call(rbind,manifest))))
+
+}
+
+if(sys.nframe()==0L) {
+ args<-commandArgs(trailingOnly=TRUE)
+ if(length(args)>1L) stop("Use: Rscript GRD_synthetic_IBS_semiblinded_v8.R quick|full")
+ invisible(run_example(if(length(args)) args[1] else "quick"))
+}

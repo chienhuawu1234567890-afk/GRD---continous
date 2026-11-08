@@ -1,457 +1,553 @@
-# GRD targeted finite-sample calibration and independent validation -- v3
-# Base R only. FULL MODE by default. RStudio: click Source.
-# There is ONLY ONE configuration block (lines 8-11); do not add a second.
-# Terminal: Rscript GRD_finite_sample_validation_v3.R full 100000 50000
-# Each method has its OWN independently fitted finite-sample boundaries.
-# Calibration, Brownian boundary fitting, and evaluation use disjoint seeds.
-# A scenario-specific calibration is NOT distribution-free Type I control.
-RUN_MODE <- "full"   # "smoke" for a quick test, "full" for the formal run
-CALIBRATION_REPS <- 100000L  # use NA_integer_ for mode-dependent defaults
-EVALUATION_REPS <- 50000L   # use NA_integer_ for mode-dependent defaults
-BROWNIAN_REPS <- 200000L  # use NA_integer_ for mode-dependent defaults
-# Change VERSION_TAG whenever altering any statistical code or scenarios.
-VERSION_TAG <- "v3_independent_method_calibration_20261029"
-cli <- if(sys.nframe()==0L) commandArgs(trailingOnly=TRUE) else character()
-mode <- if(length(cli)>=1L) cli[1] else RUN_MODE
-stopifnot(mode %in% c("smoke","full"))
-Bcal <- if(length(cli)>=2L) as.integer(cli[2]) else if(!is.na(CALIBRATION_REPS)) CALIBRATION_REPS else if(mode=="full") 100000L else 2000L
-Meval <- if(length(cli)>=3L) as.integer(cli[3]) else if(!is.na(EVALUATION_REPS)) EVALUATION_REPS else if(mode=="full") 50000L else 500L
-Bbrown <- if(!is.na(BROWNIAN_REPS)) BROWNIAN_REPS else if(mode=="full") 200000L else 20000L
-stopifnot(Bcal>=200L,Meval>=100L,Bbrown>=1000L)
-alpha <- .05
-RNGkind("Mersenne-Twister","Inversion","Rejection")
-outdir <- paste0("GRD_v3_",mode,"_B",Bcal,"_M",Meval)
-dir.create(outdir,recursive=TRUE,showWarnings=FALSE)
-cat(sprintf("Version=%s; mode=%s; calibration=%d; evaluation=%d; Brownian=%d\n",
- VERSION_TAG,mode,Bcal,Meval,Bbrown))
-routing <- function(p,eta) {
-  stopifnot(length(p)>=2L, all(is.finite(p)), all(p>0),
-            abs(sum(p)-1)<1e-10, is.finite(eta), eta>=0, eta<1)
-  Q <- (1-eta)*diag(length(p))+eta*outer(p,rep(1,length(p)))
-  stopifnot(max(abs(colSums(Q)-1))<1e-10,
-            min(svd(Q)$d)>1e-10)
-  Q
+# L-RRM versus Parametric Synthetic Data, v8. Base R only; source() executes.
+# Comparison outputs use the v7-compatible core simulation with matched empirical risk and frontier analysis.
+# Public: fixed X, treatment, visit schedule, oracle V and beta (oracle benchmarks).
+# Private: outcomes Y. Plug-in releases are NOT differentially private.
+options(stringsAsFactors=FALSE)
+getnum <- function(k,d) as.numeric(Sys.getenv(k,as.character(d)))
+getint <- function(k,d) as.integer(getnum(k,d))
+getbool <- function(k,d=FALSE) tolower(Sys.getenv(k,if(d)'true' else 'false')) %in% c('true','yes','1')
+SEED<-getint('LRRM_SEED',20261105); REPS<-getint('LRRM_REPS',5000)
+FULL<-getbool('LRRM_FULL'); OUT<-Sys.getenv('LRRM_OUT','LRRM_v8_results')
+BATCH<-getint('LRRM_BATCH',25); BOOT<-getint('LRRM_BOOT',200)
+BOOT_EVERY<-getint('LRRM_BOOT_EVERY',10); PRIV_EVERY<-getint('LRRM_PRIV_EVERY',10)
+RESUME<-getbool('LRRM_RESUME',TRUE); EPS<-getnum('LRRM_DP_EPS',0.9)
+DELTA<-getnum('LRRM_DP_DELTA',1e-5); CLIP_Y<-getnum('LRRM_DP_CLIP',10)
+CLIP_SCORE<-getnum('LRRM_SCORE_CLIP',10)
+# Sensitivity study is a separate collection of ALTERNATIVE DP releases.
+DP_SENS<-getbool('LRRM_DP_SENS',TRUE)
+DP_EVERY<-getint('LRRM_DP_EVERY',10)
+parse_grid<-function(k,default) {
+  v<-as.numeric(strsplit(Sys.getenv(k,default),',',fixed=TRUE)[[1]])
+  if(!length(v)||any(!is.finite(v)))stop('Invalid numeric grid: ',k)
+  unique(v)
 }
-privacy <- function(Q) {
-  if(any(Q<=0)) return(Inf)
-  max(vapply(seq_len(nrow(Q)),function(j) log(max(Q[j,])/min(Q[j,])),0.0))
-}
-wilson <- function(k,n,z=qnorm(.975)) {
-  if(n<1) return(c(NA_real_,NA_real_))
-  stopifnot(is.finite(k),is.finite(n),k>=0,k<=n)
-  p <- k/n
-  d <- 1+z^2/n
-  center <- (p+z^2/(2*n))/d
-  half <- z*sqrt(p*(1-p)/n+z^2/(4*n^2))/d
-  c(center-half,center+half)
-}
-# Fail fast if the interval routine is incorrectly implemented.
-stopifnot(wilson(960,20000)[1] < 0.048,
-          wilson(960,20000)[2] > 0.048,
-          wilson(0,200)[1] >= 0,
-          wilson(200,200)[2] <= 1+1e-12)
+EPS_GRID<-parse_grid('LRRM_EPS_GRID','0.3,0.5,0.9')
+CLIP_GRID<-parse_grid('LRRM_CLIP_GRID','5,10,20')
+# AUC matching is empirical, NOT formal DP equivalence.
+AUC_TOL<-getnum('LRRM_AUC_TOL',0.02)
+# Sensitivity generators shrink fitted within-patient covariance toward its diagonal.
+# These are deliberately different parametric generators; not DP and not oracle exact.
+SYN_SHRINK<-parse_grid('LRRM_SYN_SHRINK','0,0.25,0.5')
+if(any(SYN_SHRINK<0|SYN_SHRINK>1) || !any(SYN_SHRINK==0) ||
+   !is.finite(AUC_TOL) || AUC_TOL<=0 || AUC_TOL>0.5)
+  stop('Invalid synthetic covariance shrinkage or AUC tolerance')
 
-spend <- function(t) ifelse(t<=0,0,2*pnorm(-qnorm(1-alpha/2)/sqrt(t)))
+# Default: 5000 replicates per scenario, with bootstrap on every tenth replicate.
+# Each of the 500 selected replicates uses 200 bootstrap draws per eligible method.
+# Quick check: LRRM_REPS=10 LRRM_BOOT=30 LRRM_OUT=LRRM_smoke Rscript <script.R>
 
-# Calibration is independent of evaluation seeds.
-# Omnibus d-dimensional Brownian statistic is ||B_d(t)||^2/t, not Z^2 for d>1.
-calibrate <- function(d,t,B,seed) {
-  set.seed(seed); K<-length(t); boundaries<-numeric(K)
-  alive<-rep(TRUE,B); state<-matrix(0,B,d); prev<-0
-  diagnostics<-vector('list',K)
-  for(k in seq_len(K)) {
-    state<-state+matrix(rnorm(B*d,sd=sqrt(t[k]-prev)),B,d)
-    w<-rowSums(state^2)/t[k]
-    increment<-spend(t[k])-spend(prev)
-    survivors<-sum(alive)
-    prob<-increment/(survivors/B)
-    if(prob>=1) stop('Spending increment exceeds surviving probability')
-    if(prob<=0) boundaries[k]<-Inf else {
-      boundaries[k]<-unname(quantile(w[alive],1-prob,type=1))
+if(any(!is.finite(c(SEED,REPS,BATCH,BOOT,BOOT_EVERY,PRIV_EVERY,EPS,DELTA,CLIP_Y,CLIP_SCORE))) ||
+   REPS<2 || BATCH<1 || BOOT<0 || (BOOT>0 && BOOT<30) || BOOT_EVERY<1 ||
+   PRIV_EVERY<1 || DP_EVERY<1 || any(EPS_GRID<=0|EPS_GRID>=1) || any(CLIP_GRID<=0) || EPS<=0 || EPS>=1 || DELTA<=0 || DELTA>=1 ||
+   CLIP_Y<=0 || CLIP_SCORE<=0) stop('Invalid configuration; classic Gaussian calibration requires 0<epsilon<1')
+N_GRID<-if(FULL)c(100L,300L,500L,1000L) else c(100L,300L)
+T_GRID<-if(FULL)c(3L,5L,10L) else 5L
+GAMMA<-c(0,.25,.5,.75,1) # same grid in pilot and full runs
+EFFECT<-c(0,.25); CORR<-if(FULL)c('AR1','CS') else 'AR1'
+BETA_BASE<-c(1,.4,.3,0); D_RE<-matrix(c(.6,.12,.12,.15),2,2)
+SIG<-.8; RHO<-.4; Z975<-qnorm(.975)
+CAL_MULT<-sqrt(2*log(1.25/DELTA))/EPS
+DP_Y_SD<-2*CLIP_Y*CAL_MULT; DP_SCORE_SD<-2*CLIP_SCORE*CAL_MULT
+sym<-function(a)(a+t(a))/2
+sqrtm<-function(a){e<-eigen(sym(a),symmetric=TRUE);if(min(e$values)< -1e-7)stop('Not PSD');
+ e$vectors%*%diag(sqrt(pmax(e$values,0)),length(e$values))%*%t(e$vectors)}
+make_V<-function(tt,corr){z<-cbind(1,tt);m<-length(tt)
+ r<-if(corr=='AR1')SIG^2*RHO^abs(outer(seq_len(m),seq_len(m),'-')) else
+   SIG^2*(RHO+(1-RHO)*diag(m));sym(z%*%D_RE%*%t(z)+r)}
+make_design<-function(trt,tt)lapply(trt,function(a)cbind(1,tt,a,a*tt))
+make_data<-function(n,T,effect,corr,trt=NULL,beta=NULL,V=NULL){tt<-seq(0,1,length.out=T)
+ if(is.null(trt))trt<-sample(rep(c(0L,1L),length.out=n))
+ if(is.null(beta)){beta<-BETA_BASE;beta[4]<-effect}
+ if(is.null(V))V<-make_V(tt,corr)
+ X<-make_design(trt,tt);mu<-t(vapply(X,function(x)drop(x%*%beta),numeric(T)))
+ Y<-mu+matrix(rnorm(n*T),n,T)%*%t(sqrtm(V))
+ list(Y=Y,mu=mu,X=X,V=V,trt=trt,tt=tt,beta=beta,corr=corr)}
+replace_Y<-function(d,Y){d$Y<-Y;d}
+gls<-function(d,Y,V){vi<-solve(V);h<-numeric(4);H<-matrix(0,4,4)
+ for(i in seq_len(nrow(Y))){x<-d$X[[i]];H<-H+crossprod(x,vi%*%x)
+  h<-h+drop(crossprod(x,vi%*%Y[i,]))}
+ vc<-solve(H);list(beta=drop(vc%*%h),vcov=vc,H=H)}
+fit_moments<-function(d){T<-ncol(d$Y);xx<-do.call(rbind,d$X)
+ b<-drop(qr.solve(xx,as.vector(t(d$Y))))
+ for(k in seq_len(3)){mu<-t(vapply(d$X,function(x)drop(x%*%b),numeric(T)))
+  vv<-cov(d$Y-mu);ee<-eigen(sym(vv),symmetric=TRUE)
+  vv<-sym(ee$vectors%*%diag(pmax(ee$values,1e-5),T)%*%t(ee$vectors))
+  b<-gls(d,d$Y,vv)$beta}
+ list(mu=t(vapply(d$X,function(x)drop(x%*%b),numeric(T))),V=vv,beta=b)}
+release_lrrm<-function(d,g,mom){if(g==1)return(d$Y) # exact consistency
+ mom$mu+g*(d$Y-mom$mu)+matrix(rnorm(length(d$Y)),nrow(d$Y))%*%
+ t(sqrtm((1-g*g)*mom$V))}
+release_syn<-function(d,mom,shrink=0){
+  Vsyn <- (1-shrink)*mom$V + shrink*diag(diag(mom$V))
+  mom$mu+matrix(rnorm(length(d$Y)),nrow(d$Y))%*%t(sqrtm(Vsyn))
+}
+row_norm<-function(x)sqrt(rowSums(x^2))
+clip_rows<-function(x,B)x*pmin(1,B/pmax(row_norm(x),1e-12))
+score_parts<-function(d){vi<-solve(d$V);n<-nrow(d$Y);scores<-matrix(0,n,4);H<-matrix(0,4,4)
+ for(i in seq_len(n)){x<-d$X[[i]];scores[i,]<-drop(crossprod(x,vi%*%d$Y[i,]))
+  H<-H+crossprod(x,vi%*%x)}
+ list(scores=scores,H=H)}
+# DP guarantees for one ALTERNATIVE output, replacement of ONE outcome trajectory
+# at a fixed public design row. Clipping bounds L2 sensitivity by 2B.
+release_dp_y<-function(d,B=CLIP_Y,epsilon=EPS){
+ cl<-clip_rows(d$Y,B); noise_sd<-2*B*sqrt(2*log(1.25/DELTA))/epsilon
+ list(Y=cl+matrix(rnorm(length(d$Y),sd=noise_sd),nrow(d$Y)),
+  clipped=cl,noise_sd=noise_sd,rate=mean(row_norm(d$Y)>B),
+  distortion=mean((cl-d$Y)^2))}
+
+release_dp_score<-function(d,B=CLIP_SCORE,epsilon=EPS){
+ s<-score_parts(d);cl<-clip_rows(s$scores,B)
+ noise_sd<-2*B*sqrt(2*log(1.25/DELTA))/epsilon
+ noise<-rnorm(4,sd=noise_sd);vc<-solve(s$H)
+ beta<-drop(vc%*%(colSums(cl)+noise));
+ # Working variance: un-clipped Gaussian sampling variance + calibrated noise.
+ # Not generally exact after clipping; empirically validated below.
+ vv<-vc+noise_sd^2*tcrossprod(vc)
+ list(est=beta[4],se=sqrt(vv[4,4]),rate=mean(row_norm(s$scores)>B),
+  distortion=mean((cl-s$scores)^2),
+  clip_shift=drop(vc%*%colSums(cl-s$scores))[4],
+  noise_beta_sd=noise_sd*sqrt(sum(vc[4,]^2)),noise_sd=noise_sd)}
+# Fixed-design parametric bootstrap: generate a fresh confidential sample under
+# fitted beta and V, refit moments, release anew, and re-estimate.
+# It targets the fitted-model repeated-sampling SD, not a DP guarantee.
+bootstrap_se<-function(d,method,g,B){mom0<-fit_moments(d);n<-nrow(d$Y);T<-ncol(d$Y)
+ vals<-numeric(B);center<-t(vapply(d$X,function(x)drop(x%*%mom0$beta),numeric(T)))
+ root<-sqrtm(mom0$V)
+ for(b in seq_len(B)){db<-replace_Y(d,center+matrix(rnorm(n*T),n,T)%*%t(root))
+  mb<-fit_moments(db)
+  yb<-if(method=='lrrm_plugin')release_lrrm(db,g,mb) else release_syn(db,mb)
+  vals[b]<-gls(db,yb,mb$V)$beta[4]}
+ sd(vals)}
+# Oracle and practical attackers differ only in auxiliary parameters.
+# Practical attacker knows public beta baseline with zero interaction and public V.
+# Candidate-specific mean used for members and holdouts (fixes v4 normalization).
+features<-function(Y,mu,V)(Y-mu)%*%solve(sqrtm(V))
+dist2<-function(A,B)pmax(outer(rowSums(A^2),rowSums(B^2),'+')-2*tcrossprod(A,B),0)
+auc_score<-function(member,nonmember){n<-length(member);m<-length(nonmember)
+ if(!n||!m)return(NA_real_)
+ z<-rank(c(member,nonmember),ties.method='average')
+ (sum(z[seq_len(n)])-n*(n+1)/2)/(n*m)}
+attack_once<-function(d,Y,hold,kind,aux){
+ bet<-if(aux=='oracle')d$beta else BETA_BASE
+ mu_train<-t(vapply(d$X,function(x)drop(x%*%bet),numeric(ncol(d$Y))))
+ mu_hold<-t(vapply(hold$X,function(x)drop(x%*%bet),numeric(ncol(d$Y))))
+ A<-features(d$Y,mu_train,d$V);B<-features(Y,mu_train,d$V)
+ H<-features(hold$Y,mu_hold,d$V)
+ D1<-dist2(A,B);D0<-dist2(H,B)
+ D1[outer(d$trt,d$trt,'!=')]<-Inf
+ D0[outer(hold$trt,d$trt,'!=')]<-Inf
+ nearest<-max.col(-D1,ties.method='first')
+ sc1<- -apply(D1,1,min);sc0<- -apply(D0,1,min)
+ c(linkage=if(kind=='lrrm')mean(nearest==seq_len(nrow(A))) else NA_real_,
+  reconstruction=mean((d$Y-Y[nearest,,drop=FALSE])^2),
+  membership_auc=auc_score(sc1,sc0))}
+privacy_attack<-function(d,Y,hold,kind){a<-attack_once(d,Y,hold,kind,'oracle')
+ b<-attack_once(d,Y,hold,kind,'practical')
+ c(linkage_oracle=unname(a['linkage']),linkage_practical=unname(b['linkage']),
+   reconstruction_oracle=unname(a['reconstruction']),reconstruction_practical=unname(b['reconstruction']),
+   mia_auc_oracle=unname(a['membership_auc']),mia_auc_practical=unname(b['membership_auc']),
+   paired_release_mse=if(kind=='lrrm')mean((d$Y-Y)^2) else NA_real_)}
+PR_NAMES<-c('linkage_oracle','linkage_practical','reconstruction_oracle',
+ 'reconstruction_practical','mia_auc_oracle','mia_auc_practical','paired_release_mse')
+make_row<-function(d,Y,method,g,r,s,mom,hold,do_boot,ref_plugin){
+ isplug<-method=='lrrm_plugin'||grepl('^synthetic_plugin',method);isdp<-method=='dp_y'
+ Vwork<-if(isplug)mom$V else if(isdp)d$V+diag(DP_Y_SD^2,ncol(d$Y)) else d$V
+ f<-gls(d,Y,Vwork);est<-f$beta[4];se0<-sqrt(f$vcov[4,4])
+ mult<-if(method=='lrrm_plugin')2-g*g else if(grepl('^synthetic_plugin',method))2 else 1
+ se<-se0*sqrt(mult)
+ sb<-if(isplug&&do_boot && method %in% c('lrrm_plugin','synthetic_plugin'))bootstrap_se(d,method,g,BOOT) else NA_real_
+ pp<-setNames(rep(NA_real_,length(PR_NAMES)),PR_NAMES)
+ if(method=='original')pp[c('linkage_oracle','linkage_practical','reconstruction_oracle',
+   'reconstruction_practical','paired_release_mse')]<-c(1,1,0,0,0)
+ else if(!is.null(hold)&&!isdp)pp<-privacy_attack(d,Y,hold,if(grepl('lrrm',method))'lrrm' else 'synthetic')
+ consistency<-if(method=='lrrm_plugin'&&g==1)max(abs(f$beta-ref_plugin$beta)) else NA_real_
+ if(is.finite(consistency)&&consistency>1e-9)stop('gamma=1 consistency failure')
+  se_consistency<-if(method=='lrrm_plugin'&&g==1)
+    abs(se-sqrt(ref_plugin$vcov[4,4])) else NA_real_
+  if(is.finite(se_consistency)&&se_consistency>1e-9)stop('gamma=1 SE consistency failure')
+ cbind(data.frame(scenario_id=s,n=nrow(d$Y),T=ncol(d$Y),beta3=d$beta[4],corr=d$corr,
+  rep=r,gamma=g,method=method,estimate=est,se_analytic=se,se_boot=sb,
+  reject=as.integer(abs(est/se)>Z975),cover=as.integer(abs(est-d$beta[4])<=Z975*se),
+  reject_boot=if(is.finite(sb)&&sb>0)as.integer(abs(est/sb)>Z975) else NA_integer_,
+  cover_boot=if(is.finite(sb)&&sb>0)as.integer(abs(est-d$beta[4])<=Z975*sb) else NA_integer_,
+  gamma1_beta_maxdiff=consistency,gamma1_se_diff=se_consistency,
+  clip_rate=NA_real_,clip_distortion=NA_real_,clip_beta_shift=NA_real_,
+  dp_noise_sd=if(isdp)DP_Y_SD else NA_real_,dp_beta_noise_sd=NA_real_),
+  as.data.frame(as.list(pp))) }
+score_row<-function(d,r,s){z<-release_dp_score(d)
+ cbind(data.frame(scenario_id=s,n=nrow(d$Y),T=ncol(d$Y),beta3=d$beta[4],corr=d$corr,
+ rep=r,gamma=NA_real_,method='dp_score',estimate=z$est,se_analytic=z$se,se_boot=NA_real_,
+ reject=as.integer(abs(z$est/z$se)>Z975),cover=as.integer(abs(z$est-d$beta[4])<=Z975*z$se),
+ reject_boot=NA_integer_,cover_boot=NA_integer_,gamma1_beta_maxdiff=NA_real_,gamma1_se_diff=NA_real_,
+ clip_rate=z$rate,clip_distortion=z$distortion,clip_beta_shift=z$clip_shift,
+ dp_noise_sd=DP_SCORE_SD,dp_beta_noise_sd=z$noise_beta_sd),
+ as.data.frame(as.list(setNames(rep(NA_real_,length(PR_NAMES)),PR_NAMES))))}
+scenario_seed<-function(s,r)as.integer((as.double(SEED)+1000003*as.double(s)+7919*as.double(r))%%2147483646+1)
+run_rep<-function(s,z,r){set.seed(scenario_seed(s,r));d<-make_data(z$n,z$T,z$beta3,z$corr)
+ mom<-fit_moments(d);hold<-if(r%%PRIV_EVERY==0)make_data(z$n,z$T,z$beta3,z$corr) else NULL
+ boot_now<-BOOT>0&&r%%BOOT_EVERY==0
+ ref_plugin<-gls(d,d$Y,mom$V)
+ add<-function(Y,method,g=NA_real_)make_row(d,Y,method,g,r,s,mom,hold,boot_now,ref_plugin)
+ rr<-list();rr[[1]]<-add(d$Y,'original');rr[[2]]<-add(release_syn(d,list(mu=d$mu,V=d$V)),'synthetic_oracle')
+ rr[[3]]<-add(release_syn(d,mom),'synthetic_plugin')
+  for(sh in SYN_SHRINK[SYN_SHRINK>0]){
+    nm<-sprintf('synthetic_plugin_shrink_%03d',round(100*sh))
+    rr[[length(rr)+1L]]<-add(release_syn(d,mom,shrink=sh),nm)
+  }
+ dp<-release_dp_y(d);rr[[length(rr)+1L]]<-add(dp$Y,'dp_y')
+ rr[[length(rr)]]$clip_rate<-dp$rate;rr[[length(rr)]]$clip_distortion<-dp$distortion
+ rr[[length(rr)+1L]]<-score_row(d,r,s)
+ for(g in GAMMA){rr[[length(rr)+1L]]<-add(release_lrrm(d,g,list(mu=d$mu,V=d$V)),'lrrm_oracle',g)
+  rr[[length(rr)+1L]]<-add(release_lrrm(d,g,mom),'lrrm_plugin',g)}
+ do.call(rbind,rr)}
+# DP sensitivity: every configuration is an ALTERNATIVE mechanism, NOT a
+# jointly DP release.  Diagnostics here use the confidential simulated data.
+dp_sensitivity_rep<-function(s,z,r){
+  set.seed(scenario_seed(s,r)); d<-make_data(z$n,z$T,z$beta3,z$corr)
+  H<-score_parts(d)$H
+  out<-vector('list',length(EPS_GRID)*length(CLIP_GRID)*2L);j<-0L
+  for(epsilon in EPS_GRID)for(B in CLIP_GRID){
+    yy<-release_dp_y(d,B,epsilon)
+    fit<-gls(d,yy$Y,d$V+diag(yy$noise_sd^2,ncol(d$Y)))
+    se<-sqrt(fit$vcov[4,4]); est<-fit$beta[4]
+    shift<-gls(d,yy$clipped,d$V+diag(yy$noise_sd^2,ncol(d$Y)))$beta[4]-
+      gls(d,d$Y,d$V+diag(yy$noise_sd^2,ncol(d$Y)))$beta[4]
+    j<-j+1L;out[[j]]<-data.frame(scenario_id=s,n=z$n,T=z$T,beta3=z$beta3,
+      corr=z$corr,rep=r,method='dp_y',epsilon=epsilon,delta=DELTA,clip_bound=B,
+      estimate=est,se=se,reject=as.integer(abs(est/se)>Z975),
+      cover=as.integer(abs(est-z$beta3)<=Z975*se),clip_rate=yy$rate,
+      clip_distortion=yy$distortion,clip_beta_shift=shift,
+      noise_sd=yy$noise_sd,noise_beta_sd=NA_real_)
+    ss<-release_dp_score(d,B,epsilon)
+    j<-j+1L;out[[j]]<-data.frame(scenario_id=s,n=z$n,T=z$T,beta3=z$beta3,
+      corr=z$corr,rep=r,method='dp_score',epsilon=epsilon,delta=DELTA,clip_bound=B,
+      estimate=ss$est,se=ss$se,reject=as.integer(abs(ss$est/ss$se)>Z975),
+      cover=as.integer(abs(ss$est-z$beta3)<=Z975*ss$se),clip_rate=ss$rate,
+      clip_distortion=ss$distortion,clip_beta_shift=ss$clip_shift,
+      noise_sd=ss$noise_sd,noise_beta_sd=ss$noise_beta_sd)
+  }
+  do.call(rbind,out)
+}
+dp_sensitivity_summary<-function(dat){
+ if(!nrow(dat))return(NULL)
+ k<-interaction(dat$scenario_id,dat$method,dat$epsilon,dat$clip_bound,drop=TRUE)
+ do.call(rbind,lapply(split(dat,k),function(z){
+   a<-z[1,c('scenario_id','n','T','beta3','corr','method','epsilon','delta','clip_bound')]
+   a$reps<-nrow(z);a$bias<-mean(z$estimate-z$beta3)
+   a$rmse<-sqrt(mean((z$estimate-z$beta3)^2))
+   a$empirical_sd<-sd_na(z$estimate);a$mean_se<-mean(z$se)
+   a$se_ratio<-a$mean_se/a$empirical_sd
+   a$type1_or_power<-mean(z$reject);a$coverage<-mean(z$cover)
+   a$reject_mcse<-sqrt(a$type1_or_power*(1-a$type1_or_power)/a$reps)
+   a$coverage_mcse<-sqrt(a$coverage*(1-a$coverage)/a$reps)
+   a$mean_clip_rate<-mean(z$clip_rate)
+   a$mean_clip_distortion<-mean(z$clip_distortion)
+   a$mean_clip_beta_shift<-mean(z$clip_beta_shift)
+   a$mean_noise_sd<-mean(z$noise_sd)
+   a$mean_noise_beta_sd<-mean_na(z$noise_beta_sd)
+   a
+ }))
+}
+mean_na<-function(x)if(!length(x)||all(is.na(x)))NA_real_ else mean(x,na.rm=TRUE)
+sd_na<-function(x)if(sum(is.finite(x))<2)NA_real_ else sd(x[is.finite(x)])
+summary_method<-function(dat){key<-c('scenario_id','n','T','beta3','corr','method','gamma')
+ group<-interaction(dat$scenario_id,dat$method,ifelse(is.na(dat$gamma),'NA',as.character(dat$gamma)),drop=TRUE)
+ do.call(rbind,lapply(split(dat,group),function(z){a<-z[1,key,drop=FALSE];a$reps<-nrow(z)
+  a$bias<-mean(z$estimate-z$beta3);a$rmse<-sqrt(mean((z$estimate-z$beta3)^2))
+  a$empirical_sd<-sd(z$estimate);a$mean_se<-mean_na(z$se_analytic)
+  a$se_ratio<-a$mean_se/a$empirical_sd
+  for(k in c('reject','cover','reject_boot','cover_boot','clip_rate','clip_distortion',
+             'clip_beta_shift','dp_beta_noise_sd','gamma1_beta_maxdiff','gamma1_se_diff',PR_NAMES)){
+    a[[paste0('mean_',k)]]<-mean_na(z[[k]])
+    a[[paste0('n_',k)]]<-sum(is.finite(z[[k]]))}
+  a$boot_n<-sum(is.finite(z$se_boot));a$mean_boot_se<-mean_na(z$se_boot)
+  a$boot_se_ratio<-a$mean_boot_se/a$empirical_sd
+  zb<-z[is.finite(z$se_boot),,drop=FALSE]
+  a$boot_subset_empirical_sd<-sd_na(zb$estimate)
+  a$boot_subset_analytic_se<-mean_na(zb$se_analytic)
+  a$boot_subset_analytic_se_ratio<-a$boot_subset_analytic_se/a$boot_subset_empirical_sd
+  a$boot_subset_se_ratio<-a$mean_boot_se/a$boot_subset_empirical_sd
+  a$boot_subset_analytic_coverage<-mean_na(zb$cover)
+  a$boot_subset_bootstrap_coverage<-mean_na(zb$cover_boot)
+  a$boot_subset_analytic_rejection<-mean_na(zb$reject)
+  a$boot_subset_bootstrap_rejection<-mean_na(zb$reject_boot)
+  a$reject_mcse<-sqrt(a$mean_reject*(1-a$mean_reject)/a$reps)
+  a$cover_mcse<-sqrt(a$mean_cover*(1-a$mean_cover)/a$reps)
+  a$boot_cover_mcse<-if(a$n_cover_boot>0)sqrt(a$mean_cover_boot*(1-a$mean_cover_boot)/a$n_cover_boot) else NA_real_
+  a}))}
+# Matched methods within SAME confidential dataset, paired squared-error difference.
+paired_summary<-function(dat){base<-subset(dat,method=='synthetic_plugin')
+ out<-list();j<-0L
+ for(g in GAMMA){target<-subset(dat,method=='lrrm_plugin'&gamma==g)
+  if(nrow(target)!=nrow(base))stop('Paired rows missing')
+  aa<-merge(target[,c('rep','estimate','beta3')],base[,c('rep','estimate')],by='rep',suffixes=c('_lrrm','_syn'))
+  dif<-(aa$estimate_lrrm-aa$beta3)^2-(aa$estimate_syn-aa$beta3)^2
+  j<-j+1L;out[[j]]<-data.frame(scenario_id=dat$scenario_id[1],n=dat$n[1],T=dat$T[1],
+   beta3=dat$beta3[1],corr=dat$corr[1],gamma=g,reps=length(dif),
+   mean_mse_difference=mean(dif),paired_mcse=sd(dif)/sqrt(length(dif)),
+   ci_lower=mean(dif)-Z975*sd(dif)/sqrt(length(dif)),
+   ci_upper=mean(dif)+Z975*sd(dif)/sqrt(length(dif)))}
+ do.call(rbind,out)}
+# Compare plug-in releases using the same simulated dataset and holdout per replicate.
+joint_comparison <- function(dat, summary, paired) {
+  metrics <- c('rmse', 'mean_reject', 'mean_cover', 'mean_linkage_practical',
+               'mean_mia_auc_practical', 'mean_reconstruction_practical')
+  attack_metrics <- c('mia_auc_practical', 'reconstruction_practical')
+  synthetic <- subset(dat, method == 'synthetic_plugin')
+  synthetic_summary <- subset(summary, method == 'synthetic_plugin')
+  rows <- lapply(seq_len(nrow(paired)), function(i) {
+    result <- paired[i, , drop = FALSE]
+    gamma <- result$gamma
+    refraction <- dat[dat$method == 'lrrm_plugin' & dat$gamma %in% gamma, ]
+    refraction_summary <- summary[summary$method == 'lrrm_plugin' &
+                                  summary$gamma %in% gamma, ]
+    result$rejection_metric <- if (result$beta3 == 0) 'type_I_error' else 'power'
+    result$release_status <- if (gamma == 1) 'unprotected_reference' else 'perturbed'
+    for (metric in metrics) {
+      result[[paste0(metric, '_lrrm')]] <- refraction_summary[[metric]]
+      result[[paste0(metric, '_synthetic')]] <- synthetic_summary[[metric]]
     }
-    crossing<-alive & (w>=boundaries[k])
-    achieved<-mean(crossing)
-    diagnostics[[k]]<-data.frame(look=k,information_fraction=t[k],
-       target_increment=increment,achieved_increment=achieved,
-       calibration_mcse=sqrt(achieved*(1-achieved)/B),
-       surviving_paths=survivors,boundary=boundaries[k])
-    alive[crossing]<-FALSE;prev<-t[k]
-  }
-  list(boundaries=boundaries,diagnostics=do.call(rbind,diagnostics))
-}
-
-# Independent validation paths, separate from boundary-fitting paths.
-validate_boundaries <- function(d,t,b,B,seed) {
-  set.seed(seed); K<-length(t); alive<-rep(TRUE,B)
-  state<-matrix(0,B,d); prev<-0
-  rows<-vector('list',K)
-  for(k in seq_len(K)) {
-    state<-state+matrix(rnorm(B*d,sd=sqrt(t[k]-prev)),B,d)
-    w<-rowSums(state^2)/t[k]
-    crossing<-alive & w>=b[k]
-    rate<-mean(crossing); ci<-wilson(sum(crossing),B)
-    rows[[k]]<-data.frame(look=k,validation_increment=rate,
-       validation_mcse=sqrt(rate*(1-rate)/B),
-       validation_ci_low=ci[1],validation_ci_high=ci[2],
-       validation_paths=B)
-    alive[crossing]<-FALSE;prev<-t[k]
-  }
-  z<-do.call(rbind,rows)
-  z$validation_overall<-sum(z$validation_increment)
-  z$validation_overall_mcse<-sqrt(z$validation_overall*(1-z$validation_overall)/B)
-  total_ci<-wilson(sum(round(z$validation_increment*B)),B)
-  z$validation_overall_ci_low<-total_ci[1]
-  z$validation_overall_ci_high<-total_ci[2]
-  z
-}
-
-# Contrasts against the last treatment arm (placebo/reference).
-contrast_matrix <- function(g) cbind(diag(g-1),-rep(1,g-1))
-
-# At every scheduled look, even if the sequential procedure stops earlier,
-# calculate fixed-look estimates, estimated SE and ordinary 95% CI coverage.
-# The latter are NOT confidence intervals valid at a random stopping time.
-wald_ipw <- function(X,looks,C) {
-  K<-length(looks);d<-nrow(C)
-  W<-rep(NA_real_,K); contrasts<-matrix(NA_real_,K,d)
-  se<-matrix(NA_real_,K,d); failed<-rep(FALSE,K)
-  for(k in seq_len(K)) {
-    n<-looks[k];x<-X[seq_len(n),,drop=FALSE]
-    means<-colMeans(x)
-    v<-crossprod(sweep(x,2,means,'-'))/(n-1)
-    h<-C%*%v%*%t(C)
-    contrasts[k,]<-as.vector(C%*%means)
-    diag_h<-diag(h)
-    se[k,]<-sqrt(pmax(0,diag_h/n))
-    eig<-tryCatch(eigen(h,symmetric=TRUE,only.values=TRUE)$values,
-                  error=function(e) rep(NA_real_,d))
-    if(any(!is.finite(eig)) || min(eig)<=0 || min(eig)<=max(eig)*1e-10) {
-      failed[k]<-TRUE;next
+    attacks <- merge(refraction[, c('rep', attack_metrics)],
+                     synthetic[, c('rep', attack_metrics)], by = 'rep',
+                     suffixes = c('_lrrm', '_synthetic'))
+    for (metric in attack_metrics) {
+      difference <- attacks[[paste0(metric, '_lrrm')]] -
+                    attacks[[paste0(metric, '_synthetic')]]
+      difference <- difference[is.finite(difference)]
+      count <- length(difference)
+      average <- mean_na(difference)
+      mcse <- if (count > 1L) sd(difference) / sqrt(count) else NA_real_
+      result[[paste0(metric, '_pairs')]] <- count
+      result[[paste0(metric, '_difference')]] <- average
+      result[[paste0(metric, '_ci_lower')]] <- average - Z975 * mcse
+      result[[paste0(metric, '_ci_upper')]] <- average + Z975 * mcse
     }
-    vct<-contrasts[k,]
-    W[k]<-tryCatch(as.numeric(n*crossprod(vct,solve(h,vct))),
-                   error=function(e) NA_real_)
-    if(!is.finite(W[k]) || W[k]<0) {W[k]<-NA_real_;failed[k]<-TRUE}
-  }
-  list(W=W,contrasts=contrasts,se=se,failed=failed,empty=rep(FALSE,K))
+    result
+  })
+  do.call(rbind, rows)
 }
 
-wald_conventional <- function(A,Y,looks,g,C) {
-  K<-length(looks);d<-nrow(C)
-  W<-rep(NA_real_,K); contrasts<-matrix(NA_real_,K,d)
-  se<-matrix(NA_real_,K,d);failed<-rep(FALSE,K);empty<-rep(FALSE,K)
-  for(k in seq_len(K)) {
-    idx<-seq_len(looks[k]);groups<-split(Y[idx],factor(A[idx],levels=seq_len(g)))
-    ns<-lengths(groups);empty[k]<-any(ns==0)
-    if(any(ns<2)) {failed[k]<-TRUE;next}
-    means<-vapply(groups,mean,0.0)
-    vv<-vapply(groups,var,0.0)/ns
-    h<-C%*%diag(vv,g)%*%t(C)
-    contrasts[k,]<-as.vector(C%*%means)
-    se[k,]<-sqrt(pmax(0,diag(h)))
-    eig<-tryCatch(eigen(h,symmetric=TRUE,only.values=TRUE)$values,
-                  error=function(e) rep(NA_real_,d))
-    if(any(!is.finite(eig)) || min(eig)<=0 || min(eig)<=max(eig)*1e-10) {
-      failed[k]<-TRUE;next
+plot_joint_comparison <- function(summary, path) {
+  selected <- subset(summary, method=='lrrm_plugin' | grepl('^synthetic_plugin',method))
+  selected <- selected[is.finite(selected$mean_mia_auc_practical),,drop=FALSE]
+  if (!nrow(selected)) return(invisible(NULL))
+  pdf(path,width=11,height=5.5);on.exit(dev.off(),add=TRUE)
+  for(sid in unique(selected$scenario_id)) {
+    z<-selected[selected$scenario_id==sid,,drop=FALSE]
+    par(mfrow=c(1,2),mar=c(5,5,4,1))
+    for(metric in c('mean_mia_auc_practical','mean_reconstruction_practical')) {
+      x<-z[[metric]];y<-z$rmse;ok<-is.finite(x)&is.finite(y)
+      if(!any(ok)){plot.new();next}
+      cols<-ifelse(z$method=='lrrm_plugin',4,2)
+      plot(x[ok],y[ok],pch=19,col=cols[ok],xlab=metric,ylab='RMSE',
+           main=paste('Scenario',sid,'(empirical attack risk)'))
+      lab<-ifelse(z$method=='lrrm_plugin',paste0('gamma=',z$gamma),z$method)
+      text(x[ok],y[ok],labels=lab[ok],pos=3,cex=.62)
     }
-    vct<-contrasts[k,]
-    W[k]<-tryCatch(as.numeric(crossprod(vct,solve(h,vct))),
-                   error=function(e) NA_real_)
-    if(!is.finite(W[k]) || W[k]<0) {W[k]<-NA_real_;failed[k]<-TRUE}
   }
-  list(W=W,contrasts=contrasts,se=se,failed=failed,empty=empty)
+  invisible(NULL)
 }
-
-outcomes <- function(A,delta,m,sigma,model) {
-  n<-length(A)
-  noise<-switch(model,normal=rnorm(n),
-     heavy=rt(n,5)*sqrt(3/5),
-     skew=(exp(rnorm(n))-exp(.5))/sqrt(exp(2)-exp(1)),
-     stop('Unknown model'))
-  m+delta[A]+sigma[A]*noise
+# Use the same risk metric and identical attack-replication set for both methods.
+# AUC=0.5 is chance-level discrimination; larger AUC is greater measured risk.
+# Matching by mean AUC is exploratory; CI and effective n must be reported.
+matched_privacy <- function(dat, tolerance=AUC_TOL) {
+  methods<-unique(dat$method)
+  syn<-methods[grepl('^synthetic_plugin',methods)]
+  out<-list();j<-0L
+  for(sm in syn) for(g in GAMMA[GAMMA<1]) {
+    a<-dat[dat$method=='lrrm_plugin' & !is.na(dat$gamma) & dat$gamma==g,,drop=FALSE]
+    b<-dat[dat$method==sm,,drop=FALSE]
+    m<-merge(a[,c('rep','estimate','beta3','mia_auc_practical','reconstruction_practical')],
+             b[,c('rep','estimate','mia_auc_practical','reconstruction_practical')],
+             by='rep',suffixes=c('_lrrm','_syn'))
+    ok<-is.finite(m$mia_auc_practical_lrrm)&is.finite(m$mia_auc_practical_syn)
+    v<-m[ok,,drop=FALSE]
+    if(!nrow(v))next
+    dd<-v$mia_auc_practical_lrrm-v$mia_auc_practical_syn
+    risk_diff<-mean(dd);risk_mcse<-if(length(dd)>1)sd(dd)/sqrt(length(dd)) else NA_real_
+    # Utility is estimated on all paired replicates; risk on the attacked subset.
+    mse_a<-(m$estimate_lrrm-m$beta3)^2
+    mse_b<-(m$estimate_syn-m$beta3)^2
+    mse_diff<-mse_a-mse_b
+    j<-j+1L
+    out[[j]]<-data.frame(scenario_id=dat$scenario_id[1],n=dat$n[1],
+      T=dat$T[1],beta3=dat$beta3[1],corr=dat$corr[1],synthetic_method=sm,
+      gamma=g,utility_pairs=nrow(m),privacy_pairs=nrow(v),
+      auc_lrrm=mean(v$mia_auc_practical_lrrm),auc_synthetic=mean(v$mia_auc_practical_syn),
+      auc_difference=risk_diff,auc_mcse=risk_mcse,
+      auc_ci_lower=risk_diff-Z975*risk_mcse,auc_ci_upper=risk_diff+Z975*risk_mcse,
+      matched_point=abs(risk_diff)<=tolerance,
+      matched_ci=all(is.finite(c(risk_mcse,risk_diff))) &&
+        max(abs(risk_diff-Z975*risk_mcse),abs(risk_diff+Z975*risk_mcse))<=tolerance,
+      rmse_lrrm=sqrt(mean(mse_a)),rmse_synthetic=sqrt(mean(mse_b)),
+      mse_difference=mean(mse_diff),
+      mse_mcse=if(nrow(m)>1)sd(mse_diff)/sqrt(nrow(m)) else NA_real_,
+      reconstruction_lrrm=mean_na(v$reconstruction_practical_lrrm),
+      reconstruction_synthetic=mean_na(v$reconstruction_practical_syn))
+  }
+  if(!length(out))return(data.frame())
+  do.call(rbind,out)
 }
-
-# PRE-SPECIFIED FAILURE-HANDLING POLICY (v8):
-# If a covariance/Wald calculation fails at a scheduled look, there is NO
-# efficacy rejection at that look; monitoring continues to the next look.
-# If the final look fails, the simulated decision is no efficacy rejection.
-# In an actual trial, this is an UNRESOLVED ANALYSIS requiring independent
-# DMC/statistician escalation, not evidence of absence of a treatment effect.
-# No replicate is discarded. This rule defines the PRIMARY finite-sample
-# algorithm; the failure-union bound is a separate sensitivity diagnostic.
-# Results at looks after an earlier efficacy stop are calculated ONLY for
-# fixed-look calibration, not for the operational failure rate.
-decision <- function(W,b,looks,failed) {
-  stopifnot(length(W)==length(b),length(b)==length(looks),
-            length(failed)==length(W),all(!is.na(failed)))
-  # Defensive: any nonfinite statistic is a failure, not a hidden zero.
-  failed <- as.logical(failed | !is.finite(W))
-  eligible <- which(!failed & W>=b)
-  k <- if(length(eligible)) eligible[1] else 0L
-  reached <- seq_len(if(k>0L) k else length(looks))
-  failed_reached <- any(failed[reached])
-  c(reject=as.integer(k>0L),stoplook=k,
-    nstop=if(k>0L) looks[k] else tail(looks,1),
-    early=as.integer(k==1L),finalonly=as.integer(k==length(looks)),
-    failed_reached=as.integer(failed_reached),
-    failed_final_reached=as.integer(k==0L && failed[length(looks)]),
-    unresolved=as.integer(k==0L && failed[length(looks)]))
+# Empirical Pareto frontier: minimize RMSE and measured membership AUC.
+# Inferences about dominance should use uncertainty, not point estimates alone.
+frontier_summary <- function(sm) {
+  z<-sm[sm$method=='lrrm_plugin' | grepl('^synthetic_plugin',sm$method),,drop=FALSE]
+  z<-z[!(z$method=='lrrm_plugin' & z$gamma>=1) &
+       is.finite(z$rmse)&is.finite(z$mean_mia_auc_practical),,drop=FALSE]
+  if(!nrow(z))return(data.frame())
+  z$pareto_nondominated<-FALSE
+  for(sid in unique(z$scenario_id)){
+    ix<-which(z$scenario_id==sid)
+    for(i in ix){
+      dominates<-(z$rmse[ix]<=z$rmse[i] &
+                  z$mean_mia_auc_practical[ix]<=z$mean_mia_auc_practical[i] &
+                 (z$rmse[ix]<z$rmse[i] |
+                  z$mean_mia_auc_practical[ix]<z$mean_mia_auc_practical[i]))
+      z$pareto_nondominated[i]<-!any(dominates)
+    }
+  }
+  z[,c('scenario_id','n','T','beta3','corr','method','gamma','reps','rmse',
+       'mean_reject','mean_cover','mean_mia_auc_practical','n_mia_auc_practical',
+       'mean_reconstruction_practical','pareto_nondominated'),drop=FALSE]
 }
-# Unit checks for failure policy: early failure, late success; final failure;
-# efficacy stop before an irrelevant later failure.
-stopifnot(decision(c(NA,12),c(10,10),c(50,100),c(TRUE,FALSE))['reject']==1,
-          decision(c(NA,12),c(10,10),c(50,100),c(TRUE,FALSE))['nstop']==100,
-          decision(c(NA,NA),c(10,10),c(50,100),c(TRUE,TRUE))['unresolved']==1,
-          decision(c(12,NA),c(10,10),c(50,100),c(FALSE,TRUE))['failed_reached']==0)
-
-
-make_cfg <- function(id,g,N,eta,model="normal",m=0,Delta=0,K=2,
-                     sigma=NULL,p=NULL) {
- if(is.null(p)) p <- if(g==3) c(1/6,1/3,1/2) else rep(1/g,g)
- if(is.null(sigma)) sigma <- rep(1,g)
- stopifnot(length(p)==g,length(sigma)==g,all(p>0),abs(sum(p)-1)<1e-9,
-           N>=g*3,eta>=0,eta<1)
- looks <- unique(as.integer(round(seq_len(K)*N/K)))
- stopifnot(length(looks)==K,tail(looks,1)==N)
- list(id=id,g=g,N=N,eta=eta,model=model,m=m,Delta=Delta,
-      delta=seq(0,Delta,length.out=g),looks=looks,sigma=sigma,p=p)
+# Testable algebraic identities and sanity checks, no external packages.
+validate_simulation <- function() {
+  set.seed(SEED+991L);d<-make_data(100L,5L,.25,'AR1');m<-fit_moments(d)
+  y<-release_lrrm(d,1,m)
+  f<-gls(d,y,m$V);f0<-gls(d,d$Y,m$V)
+  checks<-c(gamma1_identity=identical(y,d$Y),
+    gamma1_estimator=max(abs(f$beta-f0$beta))<1e-10,
+    covariance_symmetric=max(abs(m$V-t(m$V)))<1e-10,
+    covariance_positive=min(eigen(m$V,symmetric=TRUE)$values)>0,
+    synthetic_dimension=identical(dim(release_syn(d,m)),dim(d$Y)),
+    clipping_bound=all(row_norm(clip_rows(d$Y,10))<=10+1e-8),
+    auc_perfect=abs(auc_score(c(3,4),c(1,2))-1)<1e-12,
+    auc_chance=abs(auc_score(c(1,4),c(2,3))-.5)<1e-12)
+  data.frame(test=names(checks),pass=unname(checks))
 }
-configs <- list(
- make_cfg("small35_eta0",4,35,0),
- make_cfg("small35_eta30",4,35,.30),
- make_cfg("small70_eta0",4,70,0),
- make_cfg("small70_eta30",4,70,.30),
- make_cfg("skew300_eta30",3,300,.30,"skew"),
- make_cfg("heavy300_eta30",3,300,.30,"heavy"),
- make_cfg("hetero300_eta30",3,300,.30,"normal",sigma=c(1,1.5,2)),
- make_cfg("mean1_300_eta15",3,300,.15,m=1),
- make_cfg("mean1_300_eta50",3,300,.50,m=1),
- make_cfg("normal300_eta0",3,300,0),
- make_cfg("normal300_eta15",3,300,.15),
- make_cfg("normal300_eta30",3,300,.30),
- make_cfg("normal300_eta50",3,300,.50),
- make_cfg("normal600_eta30",3,600,.30),
- make_cfg("normal600_eta50",3,600,.50),
- make_cfg("twoarm150_eta30",2,150,.30),
- make_cfg("twoarm600_eta50",2,600,.50),
- make_cfg("fourarm300_eta30",4,300,.30),
- make_cfg("looks3_300_eta30",3,300,.30,K=3),
- make_cfg("looks5_600_eta30",3,600,.30,K=5),
- make_cfg("IBS_null_eta0",3,360,0,m=-.58,K=3,p=rep(1/3,3)),
- make_cfg("IBS_null_eta15",3,360,.15,m=-.58,K=3,p=rep(1/3,3)),
- make_cfg("IBS_null_eta30",3,360,.30,m=-.58,K=3,p=rep(1/3,3)),
- make_cfg("IBS_null_eta50",3,360,.50,m=-.58,K=3,p=rep(1/3,3))
-)
-# The IBS alternative below is explicitly calibrated to m=-0.58,
-# Delta=0.47 and delta=(0,0.235,0.47), NOT observed patient-level data.
-# No claim that these are Whorwell trial's observed treatment means.
-# All other alternatives use Delta=0.5.
-# Generate each case's alternative from its matching null cfg.
-
-simulate_paths <- function(cfg,M,seed) {
- set.seed(seed)
- g<-cfg$g; N<-cfg$N; K<-length(cfg$looks); C<-contrast_matrix(g)
- Q<-routing(cfg$p,cfg$eta)
- mr<-diag(1/cfg$p,g)%*%solve(Q)
- mo<-diag(1/cfg$p,g)
- W <- array(NA_real_,dim=c(M,K,3),
-            dimnames=list(NULL,NULL,c("GRD","Original_IPW","Conventional")))
- for(r in seq_len(M)) {
-   A<-sample.int(g,N,replace=TRUE,prob=cfg$p)
-   Y<-outcomes(A,cfg$delta,cfg$m,cfg$sigma,cfg$model)
-   U<-runif(N); Ast<-integer(N)
-   for(i in seq_len(g)) {
-     ix<-which(A==i)
-     if(length(ix)) Ast[ix]<-findInterval(U[ix],
-         c(0,cumsum(Q[,i])),rightmost.closed=TRUE)
+# Robust restart: every batch is written atomically; finished batches never recomputed.
+atomic_csv<-function(x,p){tmp<-paste0(p,'.tmp');write.csv(x,tmp,row.names=FALSE,na='')
+ if(file.exists(p))unlink(p);if(!file.rename(tmp,p))stop('Cannot finalize batch ',p)}
+combine_csv<-function(paths,dest){con<-file(dest,'wt');on.exit(close(con),add=TRUE)
+ first<-TRUE
+ for(p in paths){inp<-file(p,'rt');line<-0L
+  repeat{v<-readLines(inp,n=10000L,warn=FALSE);if(!length(v))break
+   if(!first&&line==0L)v<-v[-1L]
+   if(length(v))writeLines(v,con);line<-line+1L}
+  close(inp);first<-FALSE}}
+run_all<-function(){dir.create(OUT,recursive=TRUE,showWarnings=FALSE)
+ bd<-file.path(OUT,'batches');dir.create(bd,showWarnings=FALSE)
+ grid<-expand.grid(n=N_GRID,T=T_GRID,beta3=EFFECT,corr=CORR,KEEP.OUT.ATTRS=FALSE)
+ grid$scenario_id<-seq_len(nrow(grid));grid<-grid[,c('scenario_id','n','T','beta3','corr')]
+ cfg<-c('VERSION=v8',paste0('SEED=',SEED),paste0('REPS=',REPS),paste0('BATCH=',BATCH),
+ paste0('BOOT=',BOOT),paste0('BOOT_EVERY=',BOOT_EVERY),paste0('PRIV_EVERY=',PRIV_EVERY),
+ paste0('N=',paste(N_GRID,collapse=',')),paste0('T=',paste(T_GRID,collapse=',')),
+ paste0('GAMMA=',paste(GAMMA,collapse=',')),paste0('EFFECT=',paste(EFFECT,collapse=',')),
+ paste0('CORR=',paste(CORR,collapse=',')),paste0('EPS=',EPS),paste0('DELTA=',DELTA),
+ paste0('CLIP_Y=',CLIP_Y),paste0('CLIP_SCORE=',CLIP_SCORE),
+  paste0('DP_SENS=',DP_SENS),paste0('DP_EVERY=',DP_EVERY),
+  paste0('EPS_GRID=',paste(EPS_GRID,collapse=',')),
+  paste0('CLIP_GRID=',paste(CLIP_GRID,collapse=',')),
+   paste0('SYN_SHRINK=',paste(SYN_SHRINK,collapse=',')),paste0('AUC_TOL=',AUC_TOL))
+ cf<-file.path(OUT,'configuration.txt')
+ if(file.exists(cf)&&!identical(readLines(cf,warn=FALSE),cfg))stop('Configuration mismatch: use NEW LRRM_OUT')
+ if(!file.exists(cf))writeLines(cfg,cf)
+ write.csv(grid,file.path(OUT,'scenario_manifest.csv'),row.names=FALSE)
+ cat('v8:',nrow(grid),'scenarios,',REPS,'replications; DP SD:',round(DP_Y_SD,3),round(DP_SCORE_SD,3),'\n')
+ allpaths<-character();summaries<-list();paired<-list();joint<-list();matched<-list();dp_summaries<-list();dp_paths<-character()
+ for(s in seq_len(nrow(grid))){z<-grid[s,];paths<-character()
+  for(lo in seq.int(1L,REPS,by=BATCH)){hi<-min(REPS,lo+BATCH-1L)
+   p<-file.path(bd,sprintf('scenario_%03d_reps_%07d_%07d.csv',s,lo,hi))
+   if(!RESUME||!file.exists(p)){
+    dat<-do.call(rbind,lapply(lo:hi,function(r)run_rep(s,z,r)))
+    atomic_csv(dat,p);cat('Scenario',s,'/',nrow(grid),'reps',lo,'-',hi,'\n')}
+   paths<-c(paths,p)
+    if(DP_SENS){
+      pd<-file.path(bd,sprintf('dp_sensitivity_%03d_reps_%07d_%07d.csv',s,lo,hi))
+      if(!RESUME||!file.exists(pd)){
+        rr<-seq.int(lo,hi);rr<-rr[rr%%DP_EVERY==0L]
+        if(length(rr))atomic_csv(do.call(rbind,lapply(rr,function(r)dp_sensitivity_rep(s,z,r))),pd)
+      }
+      if(file.exists(pd))dp_paths<-c(dp_paths,pd)
+    }
    }
-   stopifnot(all(Ast>=1L&Ast<=g))
-   Xr<-t(mr[,Ast,drop=FALSE])*Y
-   Xo<-t(mo[,A,drop=FALSE])*Y
-   W[r,,1]<-wald_ipw(Xr,cfg$looks,C)$W
-   W[r,,2]<-wald_ipw(Xo,cfg$looks,C)$W
-   W[r,,3]<-wald_conventional(A,Y,cfg$looks,g,C)$W
+  allpaths<-c(allpaths,paths)
+  # Only one scenario in memory at a time, not all 240,000 datasets.
+  dat<-do.call(rbind,lapply(paths,function(p)read.csv(p,na.strings=c('','NA'))))
+  summaries[[s]]<-summary_method(dat);paired[[s]]<-paired_summary(dat)
+  joint[[s]]<-joint_comparison(dat,summaries[[s]],paired[[s]])
+   matched[[s]]<-matched_privacy(dat)
  }
- W
-}
-
-
-# Brownian omnibus boundaries (dimension g-1), cached by look schedule.
-brownian_cache <- new.env(parent=emptyenv())
-get_brownian <- function(cfg) {
- t <- cfg$looks/cfg$N
- key <- paste(cfg$g,paste(format(t,digits=12),collapse="_"),sep="_")
- if(!exists(key,brownian_cache,inherits=FALSE)) {
-   seed <- 50000L+sum(utf8ToInt(key))
-   b <- calibrate(cfg$g-1,t,Bbrown,seed)$boundaries
-   assign(key,b,brownian_cache)
- }
- get(key,brownian_cache,inherits=FALSE)
-}
-
-# Quantile calibration based on first-crossing probabilities.  Nonfinite
-# statistics are non-rejections; no replicate is silently dropped.
-# At very small B, discrete quantiles cannot achieve exact spending.
-calibrate_method <- function(W,t,method) {
- stopifnot(is.matrix(W),ncol(W)==length(t))
- B<-nrow(W);K<-ncol(W);alive<-rep(TRUE,B)
- boundaries<-rep(Inf,K);prev<-0
- records<-vector("list",K)
- for(k in seq_len(K)) {
-   target<-spend(t[k])-spend(prev)
-   surv<-mean(alive)
-   q<-target/surv
-   if(!is.finite(q)||q<=0||q>=1) stop("Invalid conditional spending")
-   x<-W[alive,k];x[!is.finite(x)]<--Inf
-   finite_x<-x[is.finite(x)]
-   # If finite values cannot achieve target probability, flag infeasibility.
-   infeasible <- mean(is.finite(x)) < q
-   if(!infeasible) boundaries[k]<-unname(quantile(x,1-q,type=1))
-   crossing<-alive & is.finite(W[,k]) & W[,k]>=boundaries[k]
-   achieved<-mean(crossing)
-   records[[k]]<-data.frame(method=method,look=k,
-       target_increment=target,achieved_increment=achieved,
-       survivors=sum(alive),calibration_rejections=sum(crossing),
-       infeasible=infeasible,
-       calibration_mcse=sqrt(achieved*(1-achieved)/B))
-   alive[crossing]<-FALSE;prev<-t[k]
- }
- list(b=boundaries,diagnostics=do.call(rbind,records))
-}
-
-decide_paths <- function(W,b,looks) {
- stopifnot(is.matrix(W),length(b)==ncol(W),length(looks)==ncol(W))
- M<-nrow(W);K<-ncol(W)
- crossing<-sweep(W,2,b,">=") & is.finite(W)
- first<-max.col(crossing,ties.method="first")
- anycross<-rowSums(crossing)>0L
- first[!anycross]<-0L
- # If first efficacy stop occurs, later look failures are not operational.
- nstop<-ifelse(anycross,looks[pmax(first,1L)],tail(looks,1))
- fail<-!is.finite(W)
- reached_failure<-vapply(seq_len(M),function(i) {
-   last<-if(first[i]>0L) first[i] else K
-   any(fail[i,seq_len(last)])
- },logical(1))
- data.frame(reject=as.integer(anycross),
-            early=as.integer(first==1L),
-            nstop=nstop,
-            failed_reached=as.integer(reached_failure),
-            unresolved=as.integer(first==0L & fail[,K]))
-}
-
-metric_row <- function(cfg,method,scheme,W,b,hypothesis,seed) {
- d<-decide_paths(W,b,cfg$looks);M<-nrow(d);k<-sum(d$reject)
- ci<-wilson(k,M)
- data.frame(case=cfg$id,hypothesis=hypothesis,method=method,
-  boundary=scheme,g=cfg$g,N=cfg$N,K=length(cfg$looks),
-  eta=cfg$eta,model=cfg$model,m=cfg$m,Delta=cfg$Delta,
-  M=M,seed=seed,rejections=k,rejection_rate=k/M,
-  mcse=sqrt((k/M)*(1-k/M)/M),
-  ci_low=ci[1],ci_high=ci[2],early=mean(d$early),
-  ESS=mean(d$nstop),ESS_mcse=sd(d$nstop)/sqrt(M),
-  failed_reached=mean(d$failed_reached),
-  unresolved=mean(d$unresolved))
-}
-# Unit checks for decision logic and finite-sample boundary behavior.
-stopifnot(decide_paths(matrix(c(12,NA),1,2),c(10,10),c(50,100))$failed_reached==0,
-          decide_paths(matrix(c(NA,12),1,2),c(10,10),c(50,100))$reject==1,
-          decide_paths(matrix(c(NA,NA),1,2),c(10,10),c(50,100))$unresolved==1)
-
-methods<-c("GRD","Original_IPW","Conventional")
-all_metrics<-list();all_boundaries<-list();all_disagreement<-list()
-for(i in seq_along(configs)) {
- cfg<-configs[[i]]
- cp<-file.path(outdir,paste0(cfg$id,".rds"))
- if(file.exists(cp)) {
-   res<-readRDS(cp)
-   if(!identical(res$version,VERSION_TAG) ||
-      !identical(res$Bcal,Bcal) || !identical(res$Meval,Meval) ||
-      !identical(res$Bbrown,Bbrown))
-     stop("Checkpoint incompatible: ",cp)
-   cat(sprintf("Resume %d/%d %s\n",i,length(configs),cfg$id))
- } else {
-   cat(sprintf("Case %d/%d: %s; Bcal=%d; Meval=%d\n",
-      i,length(configs),cfg$id,Bcal,Meval));flush.console()
-   t<-cfg$looks/cfg$N
-   brown<-get_brownian(cfg)
-   seed_cal<-1000000L+i*1000L
-   seed_null<-2000000L+i*1000L
-   seed_alt<-3000000L+i*1000L
-   Wcal<-simulate_paths(cfg,Bcal,seed_cal)
-   fitted<-lapply(seq_along(methods),function(j)
-       calibrate_method(matrix(Wcal[,,j],Bcal,length(t)),t,methods[j]))
-   names(fitted)<-methods
-   rm(Wcal);invisible(gc(verbose=FALSE))
-   # Strictly independent evaluation replicates, paired across methods.
-   Wnull<-simulate_paths(cfg,Meval,seed_null)
-   alt<-cfg
-   alt$Delta<-if(grepl("^IBS_",cfg$id)) .47 else .5
-   alt$delta<-seq(0,alt$Delta,length.out=cfg$g)
-   Walt<-simulate_paths(alt,Meval,seed_alt)
-   metrics<-list();disagreement<-list();a<-0L;d<-0L
-   for(hypothesis in c("null","alternative")) {
-     W<-if(hypothesis=="null") Wnull else Walt
-     seed<-if(hypothesis=="null") seed_null else seed_alt
-     for(j in seq_along(methods)) for(scheme in c("Brownian","MethodSpecificFS")) {
-       b<-if(scheme=="Brownian") brown else fitted[[j]]$b
-       a<-a+1L
-       metrics[[a]]<-metric_row(if(hypothesis=="null") cfg else alt,
-          methods[j],scheme,matrix(W[,,j],Meval,length(t)),b,hypothesis,seed)
-     }
-     for(scheme in c("Brownian","MethodSpecificFS")) {
-       bgrd<-if(scheme=="Brownian") brown else fitted[["GRD"]]$b
-       bconv<-if(scheme=="Brownian") brown else fitted[["Conventional"]]$b
-       bori<-if(scheme=="Brownian") brown else fitted[["Original_IPW"]]$b
-       dg<-decide_paths(matrix(W[,,1],Meval,length(t)),bgrd,cfg$looks)$reject
-       dc<-decide_paths(matrix(W[,,3],Meval,length(t)),bconv,cfg$looks)$reject
-       do<-decide_paths(matrix(W[,,2],Meval,length(t)),bori,cfg$looks)$reject
-       for(reference in c("Conventional","Original_IPW")) {
-         ref<-if(reference=="Conventional") dc else do
-         delta<-dg-ref
-         d<-d+1L
-         disagreement[[d]]<-data.frame(case=cfg$id,hypothesis=hypothesis,
-           boundary=scheme,comparison=paste("GRD vs",reference),
-           disagreement=mean(delta!=0),GRD_only=mean(delta==1),
-           reference_only=mean(delta==-1),paired_difference=mean(delta),
-           M=Meval)
-       }
-     }
-   }
-   bounds<-do.call(rbind,lapply(seq_along(methods),function(j) {
-      fit<-fitted[[j]]
-      data.frame(case=cfg$id,method=methods[j],look=seq_along(t),
-       information_fraction=t,Brownian=brown,FiniteSample=fit$b,
-       calibration_seed=seed_cal,Bcal=Bcal,
-       fit$diagnostics[,c("target_increment","achieved_increment",
-       "survivors","calibration_rejections","infeasible","calibration_mcse")])
-   }))
-   res<-list(version=VERSION_TAG,Bcal=Bcal,Meval=Meval,Bbrown=Bbrown,
-     metrics=do.call(rbind,metrics),boundaries=bounds,
-     disagreements=do.call(rbind,disagreement))
-   saveRDS(res,cp)
-   rm(Wnull,Walt);invisible(gc(verbose=FALSE))
- }
- all_metrics[[i]]<-res$metrics
- all_boundaries[[i]]<-res$boundaries
- all_disagreement[[i]]<-res$disagreements
- # Persist aggregated CSVs after EVERY case for interrupted runs.
- write.csv(do.call(rbind,all_metrics),
-   file.path(outdir,"validation_metrics.csv"),row.names=FALSE)
- write.csv(do.call(rbind,all_boundaries),
-   file.path(outdir,"calibrated_boundaries.csv"),row.names=FALSE)
- write.csv(do.call(rbind,all_disagreement),
-   file.path(outdir,"paired_disagreement.csv"),row.names=FALSE)
-}
-manifest<-do.call(rbind,lapply(configs,function(x)
- data.frame(case=x$id,g=x$g,N=x$N,K=length(x$looks),
- eta=x$eta,model=x$model,m=x$m,
- p=paste(x$p,collapse=";"),sigma=paste(x$sigma,collapse=";"),
- looks=paste(x$looks,collapse=";"))))
-write.csv(manifest,file.path(outdir,"scenario_manifest.csv"),row.names=FALSE)
-summary<-subset(do.call(rbind,all_metrics),hypothesis=="null")
-summary<-summary[,c("case","method","boundary","rejection_rate","mcse",
-                      "ci_low","ci_high","failed_reached","unresolved")]
-write.csv(summary,file.path(outdir,"null_validation_summary.csv"),row.names=FALSE)
-cat("\nComplete. Output directory:",normalizePath(outdir),"\n")
-cat("Method-specific boundaries are scenario-specific; not uniform error control.\n")
+ sm<-do.call(rbind,summaries);row.names(sm)<-NULL
+ ps<-do.call(rbind,paired);row.names(ps)<-NULL
+ write.csv(sm,file.path(OUT,'utility_privacy_summary.csv'),row.names=FALSE,na='')
+ write.csv(ps,file.path(OUT,'paired_mse_comparison.csv'),row.names=FALSE,na='')
+ combine_csv(allpaths,file.path(OUT,'trial_level.csv'))
+  if(DP_SENS&&length(dp_paths)){
+    combine_csv(dp_paths,file.path(OUT,'dp_sensitivity_trial_level.csv'))
+    ds<-read.csv(file.path(OUT,'dp_sensitivity_trial_level.csv'))
+    dsm<-dp_sensitivity_summary(ds)
+    write.csv(dsm,file.path(OUT,'dp_sensitivity_summary.csv'),row.names=FALSE,na='')
+    rm(ds,dsm);gc(verbose=FALSE)
+  }
+  # A formal gamma=1 unit test, with the same covariance and estimator.
+  test_gamma1<-function(){set.seed(SEED+991L);d<-make_data(100L,5L,.25,'AR1')
+    mom<-fit_moments(d);y<-release_lrrm(d,1,mom)
+    a<-gls(d,y,mom$V);b<-gls(d,d$Y,mom$V)
+    stopifnot(identical(y,d$Y),max(abs(a$beta-b$beta))<1e-10,
+      max(abs(a$vcov-b$vcov))<1e-10)
+    data.frame(test='gamma1_exact_identity',pass=TRUE,beta_max_diff=max(abs(a$beta-b$beta)),
+      se_max_diff=max(abs(sqrt(diag(a$vcov))-sqrt(diag(b$vcov)))))
+  }
+  write.csv(test_gamma1(),file.path(OUT,'consistency_tests.csv'),row.names=FALSE)
+ dp<-subset(sm,method%in%c('dp_y','dp_score'))
+ if(nrow(dp)){pdf(file.path(OUT,'dp_reference_diagnostics.pdf'),width=9,height=5)
+  par(mfrow=c(1,2));boxplot(rmse~method,data=dp,ylab='RMSE',main='DP utility')
+  boxplot(mean_clip_rate~method,data=dp,ylab='Clipping fraction',main='DP clipping');dev.off()}
+ comparison <- do.call(rbind, joint)
+ write.csv(comparison, file.path(OUT, 'lrrm_vs_synthetic_joint_comparison.csv'),
+           row.names = FALSE, na = '')
+ plot_joint_comparison(sm, file.path(OUT, 'privacy_utility_tradeoff.pdf'))
+  matched_all<-do.call(rbind,matched)
+  if(!is.null(matched_all)&&nrow(matched_all))
+    write.csv(matched_all,file.path(OUT,'matched_privacy_comparison.csv'),row.names=FALSE,na='')
+  front<-frontier_summary(sm)
+  if(nrow(front))write.csv(front,file.path(OUT,'privacy_utility_frontier.csv'),row.names=FALSE,na='')
+  checks<-validate_simulation()
+  write.csv(checks,file.path(OUT,'simulation_validation.csv'),row.names=FALSE)
+  if(!all(checks$pass))stop('Simulation validation failed; inspect simulation_validation.csv')
+ capture.output(sessionInfo(),file=file.path(OUT,'session_info.txt'))
+ writeLines(c('v8 limitations and privacy accounting:',
+  paste0('DP outcome ALTERNATIVE: epsilon=',EPS,', delta=',DELTA,', L2 bound=',CLIP_Y,
+         ', replacement sensitivity=',2*CLIP_Y,', Gaussian SD=',format(DP_Y_SD,digits=8)),
+  paste0('DP score ALTERNATIVE: epsilon=',EPS,', delta=',DELTA,', L2 bound=',CLIP_SCORE,
+         ', replacement sensitivity=',2*CLIP_SCORE,', Gaussian SD=',format(DP_SCORE_SD,digits=8)),
+  'Each DP guarantee applies to ONE release, with public fixed design and public V.',
+  'If both DP releases are published, basic composition gives (2epsilon,2delta)-DP.',
+  'Repeated independent releases require additional privacy composition.',
+  'Diagnostic outputs computed from confidential data are NOT covered by DP guarantees.',
+  'Do not publish raw trial_level, clip rates, fitted moments or other private diagnostics as DP.',
+  'Oracle model parameters are simulation-only, not available in real clinical data.',
+  'Plug-in L-RRM and synthetic are NOT DP; no matched-DP comparison is made.',
+  'Clipping biases the DP estimand; working SEs do not correct this bias.',
+  'Parametric bootstrap uses fitted Gaussian model at fixed public design; misspecification remains.',
+  'Bootstrap coverage is estimated only on selected BOOT_EVERY replications.',
+   'Bootstrap-subset empirical SD is reported separately from full-sample empirical SD.',
+   'DP sensitivity grid rows are ALTERNATIVE mechanisms; do not jointly publish as one DP release.',
+   'DP sensitivity diagnostic CSVs are computed using private simulated data and are NOT DP.',
+   'DP score public H and V must be independent of confidential outcomes.',
+   'gamma=1 is an unprotected reference, not a privacy-preserving method.',
+  'Privacy attacks are nearest-neighbor proxies, not formal disclosure guarantees.',
+  'Practical attacker uses public baseline beta (interaction 0); oracle attacker knows true beta.',
+  'Patient linkage is meaningful only for row-aligned releases; synthetic linkage is NA.',
+  'Paired squared-error comparisons use the same confidential dataset per replication.',
+  'Synthetic covariance shrinkage variants are sensitivity generators, not guaranteed covariance-preserving.',
+   'Empirical AUC matching is not a DP guarantee or proof of privacy equivalence.',
+   'AUC matching requires sufficient overlapping privacy-risk ranges; no match may occur.',
+   'Pareto nondominance is point-estimate based and ignores Monte Carlo uncertainty.',
+   'No matched formally DP L-RRM versus DP synthetic comparison is implemented.',
+   'No MNAR/MAR, irregular visits, GAN/VAE or privately fitted synthetic models.'),
+  file.path(OUT,'LIMITATIONS.txt'))
+ cat('Results saved to',normalizePath(OUT),'\n')
+ invisible(list(summary=sm,paired=ps,joint=comparison))}
+LRRM_V8_RESULTS<-run_all()
